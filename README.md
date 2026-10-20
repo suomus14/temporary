@@ -389,3 +389,114 @@ if __name__ == "__main__":
         checker.close()
     # 確認結果を終了コードとして返す。
     sys.exit(exit_code)
+
+
+
+
+
+－－－－－－－－－－－－－－－－－－－－－－－－－－－－－－－－－－－－－－－－－－－－－－－－－－－－－－－－－－－－－－－－－－－－－－－－－－－－－－－－－－－－－－－－－－－－－－－－－－－－---------
+
+
+
+
+'''
+---------------------------------------------
+Copyright(C) Canon Inc. All right reserved.
+---------------------------------------------
+'''
+import socket
+import select
+import json
+import os
+import loggerForEsprit
+
+POLLING_TIMEOUT_ENV = 'MDAS_REQUE_RESPONSE_TIMEOUT_SEC'
+DEFAULT_POLLING_TIMEOUT_SEC = 20
+MIN_POLLING_TIMEOUT_SEC = 1
+MAX_POLLING_TIMEOUT_SEC = 3600
+
+class ScriptSender():
+    INT32_BYTES = 4
+
+    def __init__(self, service):
+        self.port = socket.getservbyname(service, 'tcp')
+        self.logger = loggerForEsprit.getLogger()
+        timeout_sec = os.environ.get(POLLING_TIMEOUT_ENV)
+        if timeout_sec is None:
+            self.logger.info(
+                '%s is not set; using default timeout of %d seconds',
+                POLLING_TIMEOUT_ENV,
+                DEFAULT_POLLING_TIMEOUT_SEC,
+            )
+            timeout_sec = DEFAULT_POLLING_TIMEOUT_SEC
+        else:
+            try:
+                timeout_sec = int(timeout_sec)
+            except ValueError:
+                timeout_sec = None
+
+            if timeout_sec is None or not MIN_POLLING_TIMEOUT_SEC <= timeout_sec <= MAX_POLLING_TIMEOUT_SEC:
+                self.logger.warning(
+                    'Invalid %s value; using default timeout of %d seconds',
+                    POLLING_TIMEOUT_ENV,
+                    DEFAULT_POLLING_TIMEOUT_SEC,
+                )
+                timeout_sec = DEFAULT_POLLING_TIMEOUT_SEC
+
+        self.polling_timeout_ms = timeout_sec * 1000
+
+    def send(self, mode, script):
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+
+            # ��³����
+            sock.connect((socket.gethostname(), self.port))
+            self.logger.info("==sock.connect port: %d" % self.port)
+
+            # �׵����������
+            self._send_data(sock, mode, script)
+            self.logger.info("==sock._send_data mode: %s, script: %s" % (mode, script))
+            sock.shutdown(socket.SHUT_WR)
+            self.logger.info("==sock.shutdown")
+
+            # ��������
+            return self._recv_data(sock)
+
+    def _send_data(self, sock, mode, script):
+        bin = script.encode('utf-8')
+        size = len(bin) + ScriptSender.INT32_BYTES
+
+        sock.sendall(size.to_bytes(ScriptSender.INT32_BYTES, 'big'))
+        sock.sendall(mode.to_bytes(ScriptSender.INT32_BYTES, 'big'))
+        sock.sendall(bin)
+
+    def _recv_data(self, sock):
+        size = self._recv_int32(sock)
+        body = self._recv_binary(sock, size)
+        self.logger.info("==sock._recv_data size: %d, body: %s" % (size, body))
+        return json.loads(body.decode('utf-8'))
+
+    def _recv_binary(self, sock, size):
+        poll = select.poll()
+        poll.register(sock, select.POLLIN)
+
+        data = b''
+        while len(data) < size:
+            ### SST000-01542 add timeout
+            ready = poll.poll(self.polling_timeout_ms)
+            if not ready:
+                ### SST000-01542 raise timeout error
+                raise TimeoutError('Timeout of poll.poll().')
+
+            remine = size - len(data)
+
+            d1 = sock.recv(remine)
+            if len(d1) == 0:
+                raise Exception('disconnect.')
+
+            data += d1
+
+        return data
+
+    def _recv_int32(self, sock):
+        data = self._recv_binary(sock, ScriptSender.INT32_BYTES)
+        return int.from_bytes(data, 'big')
