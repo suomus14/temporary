@@ -1,215 +1,346 @@
 #!/usr/bin/env python3
-"""同じ装置・ファイルグループで動作中のDataGenerator重複を検出する。"""
 
-import os  # パス名を処理する機能を読み込む。
-import sys  # 終了コードを返す機能を読み込む。
+# 必要な標準ライブラリを読み込む。
+import glob
+import os
+import re
+import subprocess
+import sys
+from datetime import datetime
 
-# 検出対象のExecutor名を設定する。
-EXECUTOR_NAME = "executor_DataGenerator.py"
-
-
-# コマンドラインからDataGeneratorの実行引数を取得する。
-def get_exec_args(argv):
-    # 対象Executor以外のプロセスを除外する。
-    if len(argv) < 2 or os.path.basename(argv[1]) != EXECUTOR_NAME:
-        # 対象外を示す値を返す。
-        return None
-
-    # Executor名より後ろの引数を取得する。
-    args = argv[2:]
-    # 先頭引数がRecovery指定か判定する。
-    recovery = bool(args and args[0] == "--recover")
-    # Recovery指定があれば引数から取り除く。
-    if recovery:
-        args = args[1:]
-    # loglevel引数がない形式を対象外にする。
-    if not args or not args[0].startswith("--loglevel="):
-        # 不正な引数を示す値を返す。
-        return None
-
-    # loglevel引数より後ろの引数を取得する。
-    args = args[1:]
-    # 必須の位置引数がそろっているか判定する。
-    if len(args) < 4:
-        # 必須引数が不足した場合は対象外を返す。
-        return None
-
-    # 後続処理で使う引数を名前付きデータにまとめて返す。
-    return {
-        "station": args[0],  # station名を設定する。
-        "start_time": args[1],  # 開始時刻を設定する。
-        "end_time": args[2],  # 終了時刻を設定する。
-        "file_group": args[3],  # ファイルグループ名を設定する。
-        "recovery": recovery,  # Recovery実行かどうかを設定する。
-    }
+# 装置情報の取得先を固定する。
+ESPRITSET_PATH = "/console/mdas/MachineList"
+# 装置情報ファイルの名前を固定する。
+ESPRITSET_NAME = "*.espritset"
+# 起動時PID情報ファイルの検索先を固定する。
+PID_LIST_GLOB = "/var/tmp/*/pid_list/pid_*.espritset"
+# 対象にする親プロセス名を固定する。
+PARENT_PROCESS_NAME = "time_handler.py"
+# 対象にする親プロセスのハンドラー名を固定する。
+PARENT_HANDLER_NAME = "DataGenerator"
+# 対象にする子プロセス名を固定する。
+CHILD_PROCESS_PATTERN = "executor_DataGenerator[.]py"
+# ログ出力先のベースパスを固定する。
+LOG_FILE_PATH = "/var/log/mdas/check_duplicate.log"
 
 
-# /procのプロセス情報からDataGeneratorの情報を取得する。
-def read_proc(proc_path):
-    # ディレクトリ名からPIDを取得する。
-    pid = int(os.path.basename(proc_path))
-
-    try:
-        # プロセス名を読み取る。
-        with open(os.path.join(proc_path, "comm"), "r", encoding="ascii") as comm_file:
-            proc_name = comm_file.read().strip()
-        # Python以外のプロセスを除外する。
-        if not proc_name.startswith("python"):
-            # 対象外を示す値を返す。
-            return None
-
-        # NUL区切りのコマンドラインを読み取る。
-        with open(os.path.join(proc_path, "cmdline"), "rb") as cmdline_file:
-            # コマンドラインを引数の配列に変換する。
-            argv = [os.fsdecode(arg) for arg in cmdline_file.read().split(b"\0") if arg]
-        # コマンドラインからExecutorの引数を取得する。
-        exec_args = get_exec_args(argv)
-        # 対象Executor以外のプロセスを除外する。
-        if exec_args is None:
-            # 対象外を示す値を返す。
-            return None
-
-        # 装置識別用の環境変数を格納する。
-        environment = {}
-        # プロセスの環境変数を読み取る。
-        with open(os.path.join(proc_path, "environ"), "rb") as environ_file:
-            # NUL区切りの環境変数を順に確認する。
-            for item in environ_file.read().split(b"\0"):
-                # KEY=VALUE形式の項目だけを処理する。
-                if b"=" in item:
-                    # 最初の等号でキーと値に分割する。
-                    key, value = item.split(b"=", 1)
-                    # 装置識別に使う環境変数だけを保存する。
-                    if key in (b"TOOL_ID", b"SERIAL_NUM"):
-                        # キーと値を文字列に変換して保存する。
-                        environment[os.fsdecode(key)] = os.fsdecode(value)
-    except (FileNotFoundError, ProcessLookupError):
-        # 読み取り前に終了したプロセスを除外する。
-        # 対象外を示す値を返す。
-        return None
-
-    # TOOL_IDを取得する。
-    tool_id = environment.get("TOOL_ID")
-    # シリアル番号を取得する。
-    serial_num = environment.get("SERIAL_NUM")
-    # TOOL_IDを優先して装置識別子を決定する。
-    equipment = tool_id or serial_num
-    # 装置を識別できないプロセスをエラーにする。
-    if not equipment:
-        # 識別情報がない理由を呼び出し元へ伝える。
-        raise ValueError("TOOL_ID and SERIAL_NUM are unavailable")
-
-    # 重複判定に使うプロセス情報をまとめて返す。
-    return {
-        "pid": pid,  # プロセスIDを設定する。
-        "tool_id": tool_id,  # TOOL_IDを設定する。
-        "serial_num": serial_num,  # シリアル番号を設定する。
-        "equipment": equipment,  # 装置識別子を設定する。
-        "equipment_source": "TOOL_ID"
-        if tool_id
-        else "SERIAL_NUM",  # 識別元を設定する。
-        "station": exec_args["station"],  # station名を設定する。
-        "start_time": exec_args["start_time"],  # 開始時刻を設定する。
-        "end_time": exec_args["end_time"],  # 終了時刻を設定する。
-        "file_group": exec_args["file_group"],  # ファイルグループ名を設定する。
-        "recovery": exec_args["recovery"],  # Recovery実行かどうかを設定する。
-    }
-
-
-# /procを走査してDataGeneratorの一覧を取得する。
-def scan_proc(proc_root="/proc"):
-    # 検出したプロセス情報を格納する。
-    records = []
-    # 走査が最後まで完了したかを記録する。
-    complete = True
-
-    # /proc直下のエントリを取得する。
-    try:
-        entries = os.listdir(proc_root)
-    except OSError as error:
-        # /procを読み取れない場合にエラーを表示する。
-        print(f"ERROR: cannot read {proc_root}: {error}")
-        # 空の結果と走査失敗を返す。
-        return records, False
-
-    # /proc直下のエントリを順に確認する。
-    for entry in entries:
-        # PID名ではないエントリを無視する。
-        if not entry.isdigit():
-            # 次のエントリへ進む。
-            continue
-
-        try:
-            # PIDディレクトリから対象プロセス情報を取得する。
-            record = read_proc(os.path.join(proc_root, entry))
-        except (OSError, ValueError) as error:
-            # プロセス情報を読み取れない場合にエラーを表示する。
-            # PIDとエラー内容を標準出力へ表示する。
-            print(f"ERROR PID {entry}: {error}")
-            # 走査が不完全であることを記録する。
-            complete = False
-            # 次のPIDの確認へ進む。
-            continue
-        # 対象プロセスだけを一覧に追加する。
-        if record is not None:
-            # 取得したプロセス情報を保存する。
-            records.append(record)
-
-    # プロセス一覧と走査完了状態を返す。
-    return records, complete
-
-
-# 装置とファイルグループが重複するプロセスを抽出する。
-def find_duplicates(records):
-    # 装置とファイルグループごとのプロセス一覧を格納する。
-    groups = {}
-    # 検出したプロセスを順に分類する。
-    for record in records:
-        # 同じ装置かつ同じファイルグループを同じキーにする。
-        key = (record["equipment"], record["file_group"])
-        # 該当するグループへプロセスを追加する。
-        groups.setdefault(key, []).append(record)
-
-    # 2件以上のプロセスがあるグループだけを返す。
-    return {key: items for key, items in groups.items() if len(items) > 1}
-
-
-# 重複結果を表示して終了コードを返す。
-def main():
-    # DataGeneratorのプロセス一覧と走査状態を取得する。
-    records, complete = scan_proc()
-    # 装置とファイルグループが重複するプロセスを抽出する。
-    duplicates = find_duplicates(records)
-
-    # 重複したグループを順に表示する。
-    for (equipment, file_group), processes in sorted(duplicates.items()):
-        # 装置、ファイルグループ、重複数を表示する。
-        print(
-            f"DUPLICATE equipment={equipment} file_group={file_group} "
-            f"count={len(processes)}"
+# 重複起動を確認する。
+class DuplicateChecker:
+    # ログファイルを開いて状態を初期化する。
+    def __init__(self):
+        # ログ出力先のディレクトリを取得する。
+        log_directory = os.path.dirname(LOG_FILE_PATH)
+        # ログ出力先のディレクトリが指定されている場合に作成する。
+        if log_directory:
+            # 存在しないログ出力先のディレクトリを作成する。
+            os.makedirs(log_directory, exist_ok=True)
+        # ベースパスからファイル名と拡張子を分離する。
+        log_base, log_extension = os.path.splitext(LOG_FILE_PATH)
+        # 日付をファイル名に付けた出力パスを作成する。
+        dated_log_path = "{}_{}{}".format(
+            log_base,
+            datetime.now().strftime("%Y%m%d"),
+            log_extension,
         )
-        # グループ内のプロセスをPID順に表示する。
-        for process in sorted(processes, key=lambda item: item["pid"]):
-            # プロセスの実行条件を表示する。
-            print(
-                "  PID={pid} station={station} "
-                "range={start_time}-{end_time} recovery={recovery}".format(**process)
+        # 当日分のログファイルを追記モードで開く。
+        self._log_file = open(dated_log_path, "a", encoding="utf-8")
+        # 重複検出状態を初期化する。
+        self._duplicate_found = False
+        # エラー発生状態を初期化する。
+        self._error_found = False
+
+    # 形式をそろえてログを出力する。
+    def _log(self, level, message):
+        # 現在時刻をログ形式に変換する。
+        timestamp = datetime.now().strftime("%Y/%m/%d %H:%M:%S")
+        # ログ行を生成する。
+        log_line = f"{timestamp} [{level}] {message}"
+        # ログ行を標準出力に表示する。
+        print(log_line)
+        # ログ行をファイルに書き込む。
+        self._log_file.write(log_line + "\n")
+        # ログ行をすぐに保存する。
+        self._log_file.flush()
+
+    # 情報ログを出力する。
+    def log_info(self, message):
+        # INFOレベルでログを出力する。
+        self._log("INFO ", message)
+
+    # 警告ログを出力する。
+    def log_warn(self, message):
+        # WARNレベルでログを出力する。
+        self._log("WARN ", message)
+
+    # エラーログを出力する。
+    def log_error(self, message):
+        # エラー発生状態を記録する。
+        self._error_found = True
+        # ERRORレベルでログを出力する。
+        self._log("ERROR", message)
+
+    # MachineListから装置情報を取得する。
+    def get_equip_info(self):
+        # 装置情報の取得開始を記録する。
+        self.log_info(
+            "==================== Read the espritset files ==========================="
+        )
+        # MachineListから装置情報ファイルを検索する。
+        file_list = sorted(glob.glob(os.path.join(ESPRITSET_PATH, ESPRITSET_NAME)))
+        # 検索した装置情報ファイル数を記録する。
+        self.log_info(f"Number of espritset files = {len(file_list)}")
+        # 装置情報ファイルがない場合にエラーを記録する。
+        if not file_list:
+            # 装置情報がないことをログに出力する。
+            self.log_error("Espritset file not found")
+        # 取得した装置情報を格納する。
+        equip_list = []
+        # 装置情報ファイルを順に読み込む。
+        for file_path in file_list:
+            # 装置情報の値を初期化する。
+            equip_info = {"tool_id": "", "serial_num": "", "machine_type": ""}
+            # 装置情報ファイルを読み込む。
+            try:
+                # UTF-8のテキストとして装置情報を開く。
+                with open(file_path, "r", encoding="utf-8") as equip_file:
+                    # 装置情報の各行を確認する。
+                    for line in equip_file:
+                        # TOOL_IDの値を取得する。
+                        tool_id_match = re.match(
+                            r"^\s*setenv\s+TOOL_ID\s+(.+?)\s*$", line
+                        )
+                        # シリアル番号の値を取得する。
+                        serial_match = re.match(
+                            r"^\s*setenv\s+SERIAL_NUM\s+(.+?)\s*$", line
+                        )
+                        # 装置種別の値を取得する。
+                        type_match = re.match(
+                            r"^\s*setenv\s+ESPRIT_MACHINE_TYPE\s+(.+?)\s*$", line
+                        )
+                        # TOOL_IDが見つかった場合に保存する。
+                        if tool_id_match:
+                            # 引用符を除いてTOOL_IDを保存する。
+                            equip_info["tool_id"] = tool_id_match.group(1).strip("\"'")
+                        # シリアル番号が見つかった場合に保存する。
+                        if serial_match:
+                            # 引用符を除いてシリアル番号を保存する。
+                            equip_info["serial_num"] = serial_match.group(1).strip(
+                                "\"'"
+                            )
+                        # 装置種別が見つかった場合に保存する。
+                        if type_match:
+                            # 引用符を除いて装置種別を保存する。
+                            equip_info["machine_type"] = type_match.group(1).strip(
+                                "\"'"
+                            )
+            # ファイルを読み込めない場合にエラーを記録する。
+            except (OSError, UnicodeError) as error:
+                # 読み込みに失敗したファイル名と理由を記録する。
+                self.log_error(f"Cannot read {file_path}: {error}")
+                # 次の装置情報ファイルを確認する。
+                continue
+            # 読み込んだ装置情報ファイル名を記録する。
+            self.log_info(f"- {os.path.basename(file_path)}")
+            # TOOL_IDを記録する。
+            self.log_info("    Name: {}".format(equip_info["tool_id"]))
+            # 装置種別を記録する。
+            self.log_info("    Type: {}".format(equip_info["machine_type"]))
+            # シリアル番号を記録する。
+            self.log_info("    S/N : {}".format(equip_info["serial_num"]))
+            # TOOL_IDがない場合に装置を対象外にする。
+            if not equip_info["tool_id"]:
+                # PIDファイルを特定できない理由を記録する。
+                self.log_error(f"TOOL_ID not found in {file_path}")
+                # 次の装置情報ファイルを確認する。
+                continue
+            # 取得した装置情報を一覧に追加する。
+            equip_list.append(equip_info)
+        # 取得した装置情報一覧を返す。
+        return equip_list
+
+    # pid_listからDataGeneratorの親プロセスPIDを取得する。
+    def get_parent_pids(self, tool_id):
+        # 対象装置のPIDファイル名を決定する。
+        expected_file_name = f"pid_{tool_id}.espritset"
+        # 対象装置のPIDファイルを検索する。
+        pid_files = [
+            path
+            for path in glob.glob(PID_LIST_GLOB)
+            if os.path.basename(path) == expected_file_name
+        ]
+        # 親プロセスPIDを重複なく格納する。
+        parent_pids = set()
+        # 装置別PIDファイルを順に読み込む。
+        for pid_file_path in pid_files:
+            # PIDファイルを読み込む。
+            try:
+                # UTF-8のテキストとしてPIDファイルを開く。
+                with open(pid_file_path, "r", encoding="utf-8") as pid_file:
+                    # PIDファイルの各行を確認する。
+                    for line in pid_file:
+                        # 行を空白区切りで分割する。
+                        fields = line.split()
+                        # DataGenerator用time_handlerの行だけを処理する。
+                        if (
+                            len(fields) >= 3
+                            and fields[0] == PARENT_PROCESS_NAME
+                            and fields[2] == PARENT_HANDLER_NAME
+                        ):
+                            # PIDを整数として読み取る。
+                            try:
+                                # 親プロセスPIDを重複なく保存する。
+                                parent_pids.add(int(fields[1]))
+                            # PIDが数値でない場合に警告する。
+                            except ValueError:
+                                # 不正なPID情報をログに出力する。
+                                self.log_warn(
+                                    f"Invalid parent PID in {pid_file_path}: {line.strip()}"
+                                )
+            # PIDファイルを読み込めない場合にエラーを記録する。
+            except (OSError, UnicodeError) as error:
+                # 読み込みに失敗したファイル名と理由を記録する。
+                self.log_error(f"Cannot read {pid_file_path}: {error}")
+        # PIDファイルが見つからない場合に警告する。
+        if not pid_files:
+            # 対象装置のPIDファイルがないことを記録する。
+            self.log_error(f"PID list file not found for TOOL_ID {tool_id}")
+        # 親プロセスが見つからない場合に警告する。
+        elif not parent_pids:
+            # DataGeneratorの親PIDがないことを記録する。
+            self.log_warn(f"DataGenerator parent PID not found for TOOL_ID {tool_id}")
+        # 親プロセスPIDを昇順で返す。
+        return sorted(parent_pids)
+
+    # pgrepで親プロセスに属するDataGeneratorの子PIDを取得する。
+    def get_child_pids(self, parent_pid):
+        # pgrepの親PID指定とプロセス名指定を組み立てる。
+        command = ["pgrep", "-P", str(parent_pid), "-f", CHILD_PROCESS_PATTERN]
+        # pgrepを実行して子PIDを取得する。
+        try:
+            # pgrepの標準出力と標準エラーを取得する。
+            result = subprocess.run(
+                command,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                check=False,
             )
+        # pgrepを起動できない場合にエラーを記録する。
+        except OSError as error:
+            # pgrepの実行失敗をログに出力する。
+            self.log_error(f"Cannot execute pgrep: {error}")
+            # 取得できないことを呼び出し元へ伝える。
+            return None
+        # pgrepが該当プロセスなしを返した場合に空一覧を返す。
+        if result.returncode == 1:
+            # 子プロセスがないことを空一覧で返す。
+            return []
+        # pgrepが異常終了した場合にエラーを記録する。
+        if result.returncode != 0:
+            # pgrepの標準エラーをログに出力する。
+            self.log_error(
+                f"pgrep failed for parent PID {parent_pid}: {result.stderr.strip()}"
+            )
+            # 取得できないことを呼び出し元へ伝える。
+            return None
+        # pgrepの出力から子PID一覧を作成する。
+        child_pids = result.stdout.splitlines()
+        # pgrepのPID出力が数値か確認する。
+        if any(not child_pid.isdigit() for child_pid in child_pids):
+            # 不正なpgrep出力をエラーとして記録する。
+            self.log_error(
+                f"Invalid pgrep output for parent PID {parent_pid}: {result.stdout.strip()}"
+            )
+            # 不正な出力を呼び出し元へ伝える。
+            return None
+        # 子PID一覧を返す。
+        return child_pids
 
-    # 重複がない場合に走査件数を表示する。
-    if not duplicates:
-        print(f"No duplicate DataGenerator processes found ({len(records)} scanned).")
-    # 重複がある場合に重複ありの終了コードを返す。
-    if duplicates:
-        return 1
-    # 走査が不完全な場合にエラー終了コードを返す。
-    if not complete:
-        return 2
-    # 重複がなく走査も完了した場合に正常終了コードを返す。
-    return 0
+    # 装置ごとにDataGeneratorの子プロセス数を確認する。
+    def check_equip(self, equip_info):
+        # 装置識別情報をログに出力する。
+        self.log_info(
+            "- Name: {} / Type: {} / S/N: {}".format(
+                equip_info["tool_id"],
+                equip_info["machine_type"],
+                equip_info["serial_num"],
+            )
+        )
+        # pid_listから対象装置の親PID一覧を取得する。
+        parent_pids = self.get_parent_pids(equip_info["tool_id"])
+        # 装置に紐づく子PIDを格納する。
+        child_pids = set()
+        # 親プロセスごとに子プロセス数を確認する。
+        for parent_pid in parent_pids:
+            # 親プロセスの子PID一覧をpgrepで取得する。
+            parent_children = self.get_child_pids(parent_pid)
+            # pgrepが失敗した場合に次の親プロセスへ進む。
+            if parent_children is None:
+                # 次の親プロセスを確認する。
+                continue
+            # 親PIDごとの子プロセス数を記録する。
+            self.log_info(
+                f"    Parent PID: {parent_pid} / DataGenerator child count: {len(parent_children)}"
+            )
+            # 取得した子PIDを装置の一覧に追加する。
+            child_pids.update(parent_children)
+        # 子プロセスが複数ある場合に重複を記録する。
+        if len(child_pids) > 1:
+            # 重複状態を記録する。
+            self._duplicate_found = True
+            # 重複した装置と子PID一覧をエラー出力する。
+            self.log_error(
+                "DUPLICATE DataGenerator processes: TOOL_ID={} count={} child PIDs={}".format(
+                    equip_info["tool_id"],
+                    len(child_pids),
+                    ",".join(sorted(child_pids, key=int)),
+                )
+            )
+        # 子プロセスが1つ以下の場合に確認結果を記録する。
+        else:
+            # 子PIDがない場合に正常状態を記録する。
+            self.log_info(f"    DataGenerator child count: {len(child_pids)}")
+
+    # 全装置の確認を実行する。
+    def main(self):
+        # 重複確認の開始をログに出力する。
+        self.log_info(
+            "==================== Check DataGenerator duplicates ===================="
+        )
+        # MachineListから全装置情報を取得する。
+        equip_list = self.get_equip_info()
+        # 装置ごとに重複確認を実行する。
+        for equip_info in equip_list:
+            # 対象装置の子プロセス数を確認する。
+            self.check_equip(equip_info)
+        # 重複が検出された場合に重複終了コードを返す。
+        if self._duplicate_found:
+            # 重複状態を終了コード1で返す。
+            return 1
+        # エラーが発生した場合にエラー終了コードを返す。
+        if self._error_found:
+            # エラー状態を終了コード2で返す。
+            return 2
+        # 問題がない場合に正常終了コードを返す。
+        return 0
+
+    # ログファイルを閉じて確認を終了する。
+    def close(self):
+        # ログファイルを閉じる。
+        self._log_file.close()
 
 
-# 直接実行された場合にmainを実行する。
+# 直接実行された場合に確認処理を開始する。
 if __name__ == "__main__":
-    # mainの終了コードでプロセスを終了する。
-    sys.exit(main())
+    # 確認処理インスタンスを生成する。
+    checker = DuplicateChecker()
+    # 確認処理後に必ずログファイルを閉じる。
+    try:
+        # 確認結果を取得する。
+        exit_code = checker.main()
+    # 例外発生時もログファイルを閉じる。
+    finally:
+        # ログファイルを閉じる。
+        checker.close()
+    # 確認結果を終了コードとして返す。
+    sys.exit(exit_code)
