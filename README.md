@@ -20,6 +20,8 @@ PARENT_PROCESS_NAME = "time_handler.py"
 PARENT_HANDLER_NAME = "DataGenerator"
 # 対象にする子プロセス名を固定する。
 CHILD_PROCESS_PATTERN = "executor_DataGenerator[.]py"
+# 再起動に使うMDAS起動スクリプトを固定する。
+MDAS_ACTIVATION_SCRIPT = "/home/ifour/TOOLS/mdas_activation.sh"
 # ログ出力先のベースパスを固定する。
 LOG_FILE_PATH = "/var/log/mdas/check_duplicate.log"
 
@@ -301,6 +303,47 @@ class DuplicateChecker:
             # 子PIDがない場合に正常状態を記録する。
             self.log_info(f"    DataGenerator child count: {len(child_pids)}")
 
+    # 重複が発生した場合に全装置のMDASを再起動する。
+    def restart_all_mdas(self):
+        # 全装置を対象に非対話モードで再起動するコマンドを組み立てる。
+        command = [MDAS_ACTIVATION_SCRIPT, "-a", "-y"]
+        # 全装置の再起動開始をログに出力する。
+        self.log_warn("Restarting MDAS for all equipment using mdas_activation.sh")
+        # MDAS起動スクリプトを実行する。
+        try:
+            # 標準出力と標準エラーを取得して起動結果を確認する。
+            result = subprocess.run(
+                command,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                check=False,
+            )
+        # activationスクリプトを実行できない場合にエラーを記録する。
+        except OSError as error:
+            # 全装置の再起動コマンド失敗をログに出力する。
+            self.log_error(f"Cannot restart all MDAS equipment: {error}")
+            # 再起動処理を終了する。
+            return
+        # 起動スクリプトの標準出力をログに記録する。
+        if result.stdout.strip():
+            # 標準出力をINFOログに出力する。
+            self.log_info(result.stdout.strip())
+        # 起動スクリプトの標準エラーをログに記録する。
+        if result.stderr.strip():
+            # 標準エラーをWARNログに出力する。
+            self.log_warn(result.stderr.strip())
+        # 再起動に失敗した場合にエラーを記録する。
+        if result.returncode != 0:
+            # 終了コードを含めて再起動失敗を記録する。
+            self.log_error(
+                f"MDAS restart failed for all equipment with exit code {result.returncode}"
+            )
+            # 再起動成功処理へ進まない。
+            return
+        # 再起動成功をログに記録する。
+        self.log_info("MDAS restart completed for all equipment")
+
     # 全装置の確認を実行する。
     def main(self):
         # 重複確認の開始をログに出力する。
@@ -313,8 +356,10 @@ class DuplicateChecker:
         for equip_info in equip_list:
             # 対象装置の子プロセス数を確認する。
             self.check_equip(equip_info)
-        # 重複が検出された場合に重複終了コードを返す。
+        # 重複が見つかった場合に全装置のMDASを再起動する。
         if self._duplicate_found:
+            # 全装置のMDAS再起動を実行する。
+            self.restart_all_mdas()
             # 重複状態を終了コード1で返す。
             return 1
         # エラーが発生した場合にエラー終了コードを返す。
