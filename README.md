@@ -1,1022 +1,4722 @@
-#!/usr/bin/env python3
-
-# 必要な標準ライブラリを読み込む。
-import glob
-import os
-import re
-import subprocess
-import sys
-from datetime import datetime
-
-# 装置情報の取得先を固定する。
-ESPRITSET_PATH = "/console/mdas/MachineList"
-# 装置情報ファイルの名前を固定する。
-ESPRITSET_NAME = "*.espritset"
-# 起動時PID情報ファイルの検索先を固定する。
-PID_LIST_GLOB = "/var/tmp/*/pid_list/pid_*.espritset"
-# 対象にする親プロセス名を固定する。
-PARENT_PROCESS_NAME = "time_handler.py"
-# 対象にする親プロセスのハンドラー名を固定する。
-PARENT_HANDLER_NAME = "DataGenerator"
-# 対象にする子プロセス名を固定する。
-CHILD_PROCESS_PATTERN = "executor_DataGenerator[.]py"
-# 再起動に使うMDAS起動スクリプトを固定する。
-MDAS_ACTIVATION_SCRIPT = "/home/ifour/TOOLS/mdas_activation.sh"
-# ログ出力先のベースパスを固定する。
-LOG_FILE_PATH = "/var/log/mdas/check_duplicate.log"
-
-
-# 重複起動を確認する。
-class DuplicateChecker:
-    # ログファイルを開いて状態を初期化する。
-    def __init__(self):
-        # ログ出力先のディレクトリを取得する。
-        log_directory = os.path.dirname(LOG_FILE_PATH)
-        # ログ出力先のディレクトリが指定されている場合に作成する。
-        if log_directory:
-            # 存在しないログ出力先のディレクトリを作成する。
-            os.makedirs(log_directory, exist_ok=True)
-        # ベースパスからファイル名と拡張子を分離する。
-        log_base, log_extension = os.path.splitext(LOG_FILE_PATH)
-        # 日付をファイル名に付けた出力パスを作成する。
-        dated_log_path = "{}_{}{}".format(
-            log_base,
-            datetime.now().strftime("%Y%m%d"),
-            log_extension,
-        )
-        # 当日分のログファイルを追記モードで開く。
-        self._log_file = open(dated_log_path, "a", encoding="utf-8")
-        # 重複検出状態を初期化する。
-        self._duplicate_found = False
-        # エラー発生状態を初期化する。
-        self._error_found = False
-
-    # 形式をそろえてログを出力する。
-    def _log(self, level, message):
-        # 現在時刻をログ形式に変換する。
-        timestamp = datetime.now().strftime("%Y/%m/%d %H:%M:%S")
-        # ログ行を生成する。
-        log_line = f"{timestamp} [{level}] {message}"
-        # ログ行を標準出力に表示する。
-        print(log_line)
-        # ログ行をファイルに書き込む。
-        self._log_file.write(log_line + "\n")
-        # ログ行をすぐに保存する。
-        self._log_file.flush()
-
-    # 情報ログを出力する。
-    def log_info(self, message):
-        # INFOレベルでログを出力する。
-        self._log("INFO ", message)
-
-    # 警告ログを出力する。
-    def log_warn(self, message):
-        # WARNレベルでログを出力する。
-        self._log("WARN ", message)
-
-    # エラーログを出力する。
-    def log_error(self, message):
-        # エラー発生状態を記録する。
-        self._error_found = True
-        # ERRORレベルでログを出力する。
-        self._log("ERROR", message)
-
-    # MachineListから装置情報を取得する。
-    def get_equip_info(self):
-        # 装置情報の取得開始を記録する。
-        self.log_info(
-            "==================== Read the espritset files ==========================="
-        )
-        # MachineListから装置情報ファイルを検索する。
-        file_list = sorted(glob.glob(os.path.join(ESPRITSET_PATH, ESPRITSET_NAME)))
-        # 検索した装置情報ファイル数を記録する。
-        self.log_info(f"Number of espritset files = {len(file_list)}")
-        # 装置情報ファイルがない場合にエラーを記録する。
-        if not file_list:
-            # 装置情報がないことをログに出力する。
-            self.log_error("Espritset file not found")
-        # 取得した装置情報を格納する。
-        equip_list = []
-        # 装置情報ファイルを順に読み込む。
-        for file_path in file_list:
-            # 装置情報の値を初期化する。
-            equip_info = {"tool_id": "", "serial_num": "", "machine_type": ""}
-            # 装置情報ファイルを読み込む。
-            try:
-                # UTF-8のテキストとして装置情報を開く。
-                with open(file_path, "r", encoding="utf-8") as equip_file:
-                    # 装置情報の各行を確認する。
-                    for line in equip_file:
-                        # TOOL_IDの値を取得する。
-                        tool_id_match = re.match(
-                            r"^\s*setenv\s+TOOL_ID\s+(.+?)\s*$", line
-                        )
-                        # シリアル番号の値を取得する。
-                        serial_match = re.match(
-                            r"^\s*setenv\s+SERIAL_NUM\s+(.+?)\s*$", line
-                        )
-                        # 装置種別の値を取得する。
-                        type_match = re.match(
-                            r"^\s*setenv\s+ESPRIT_MACHINE_TYPE\s+(.+?)\s*$", line
-                        )
-                        # TOOL_IDが見つかった場合に保存する。
-                        if tool_id_match:
-                            # 引用符を除いてTOOL_IDを保存する。
-                            equip_info["tool_id"] = tool_id_match.group(1).strip("\"'")
-                        # シリアル番号が見つかった場合に保存する。
-                        if serial_match:
-                            # 引用符を除いてシリアル番号を保存する。
-                            equip_info["serial_num"] = serial_match.group(1).strip(
-                                "\"'"
-                            )
-                        # 装置種別が見つかった場合に保存する。
-                        if type_match:
-                            # 引用符を除いて装置種別を保存する。
-                            equip_info["machine_type"] = type_match.group(1).strip(
-                                "\"'"
-                            )
-            # ファイルを読み込めない場合にエラーを記録する。
-            except (OSError, UnicodeError) as error:
-                # 読み込みに失敗したファイル名と理由を記録する。
-                self.log_error(f"Cannot read {file_path}: {error}")
-                # 次の装置情報ファイルを確認する。
-                continue
-            # 読み込んだ装置情報ファイル名を記録する。
-            self.log_info(f"- {os.path.basename(file_path)}")
-            # TOOL_IDを記録する。
-            self.log_info("    Name: {}".format(equip_info["tool_id"]))
-            # 装置種別を記録する。
-            self.log_info("    Type: {}".format(equip_info["machine_type"]))
-            # シリアル番号を記録する。
-            self.log_info("    S/N : {}".format(equip_info["serial_num"]))
-            # TOOL_IDがない場合に装置を対象外にする。
-            if not equip_info["tool_id"]:
-                # PIDファイルを特定できない理由を記録する。
-                self.log_error(f"TOOL_ID not found in {file_path}")
-                # 次の装置情報ファイルを確認する。
-                continue
-            # 取得した装置情報を一覧に追加する。
-            equip_list.append(equip_info)
-        # 取得した装置情報一覧を返す。
-        return equip_list
-
-    # pid_listからDataGeneratorの親プロセスPIDを取得する。
-    def get_parent_pids(self, tool_id):
-        # 対象装置のPIDファイル名を決定する。
-        expected_file_name = f"pid_{tool_id}.espritset"
-        # 対象装置のPIDファイルを検索する。
-        pid_files = [
-            path
-            for path in glob.glob(PID_LIST_GLOB)
-            if os.path.basename(path) == expected_file_name
-        ]
-        # 親プロセスPIDを重複なく格納する。
-        parent_pids = set()
-        # 装置別PIDファイルを順に読み込む。
-        for pid_file_path in pid_files:
-            # PIDファイルを読み込む。
-            try:
-                # UTF-8のテキストとしてPIDファイルを開く。
-                with open(pid_file_path, "r", encoding="utf-8") as pid_file:
-                    # PIDファイルの各行を確認する。
-                    for line in pid_file:
-                        # 行を空白区切りで分割する。
-                        fields = line.split()
-                        # DataGenerator用time_handlerの行だけを処理する。
-                        if (
-                            len(fields) >= 3
-                            and fields[0] == PARENT_PROCESS_NAME
-                            and fields[2] == PARENT_HANDLER_NAME
-                        ):
-                            # PIDを整数として読み取る。
-                            try:
-                                # 親プロセスPIDを重複なく保存する。
-                                parent_pids.add(int(fields[1]))
-                            # PIDが数値でない場合に警告する。
-                            except ValueError:
-                                # 不正なPID情報をログに出力する。
-                                self.log_warn(
-                                    f"Invalid parent PID in {pid_file_path}: {line.strip()}"
-                                )
-            # PIDファイルを読み込めない場合にエラーを記録する。
-            except (OSError, UnicodeError) as error:
-                # 読み込みに失敗したファイル名と理由を記録する。
-                self.log_error(f"Cannot read {pid_file_path}: {error}")
-        # PIDファイルが見つからない場合に警告する。
-        if not pid_files:
-            # 対象装置のPIDファイルがないことを記録する。
-            self.log_error(f"PID list file not found for TOOL_ID {tool_id}")
-        # 親プロセスが見つからない場合に警告する。
-        elif not parent_pids:
-            # DataGeneratorの親PIDがないことを記録する。
-            self.log_warn(f"DataGenerator parent PID not found for TOOL_ID {tool_id}")
-        # 親プロセスPIDを昇順で返す。
-        return sorted(parent_pids)
-
-    # pgrepで親プロセスに属するDataGeneratorの子PIDを取得する。
-    def get_child_pids(self, parent_pid):
-        # pgrepの親PID指定とプロセス名指定を組み立てる。
-        command = ["pgrep", "-P", str(parent_pid), "-f", CHILD_PROCESS_PATTERN]
-        # pgrepを実行して子PIDを取得する。
-        try:
-            # pgrepの標準出力と標準エラーを取得する。
-            result = subprocess.run(
-                command,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                text=True,
-                check=False,
-            )
-        # pgrepを起動できない場合にエラーを記録する。
-        except OSError as error:
-            # pgrepの実行失敗をログに出力する。
-            self.log_error(f"Cannot execute pgrep: {error}")
-            # 取得できないことを呼び出し元へ伝える。
-            return None
-        # pgrepが該当プロセスなしを返した場合に空一覧を返す。
-        if result.returncode == 1:
-            # 子プロセスがないことを空一覧で返す。
-            return []
-        # pgrepが異常終了した場合にエラーを記録する。
-        if result.returncode != 0:
-            # pgrepの標準エラーをログに出力する。
-            self.log_error(
-                f"pgrep failed for parent PID {parent_pid}: {result.stderr.strip()}"
-            )
-            # 取得できないことを呼び出し元へ伝える。
-            return None
-        # pgrepの出力から子PID一覧を作成する。
-        child_pids = result.stdout.splitlines()
-        # pgrepのPID出力が数値か確認する。
-        if any(not child_pid.isdigit() for child_pid in child_pids):
-            # 不正なpgrep出力をエラーとして記録する。
-            self.log_error(
-                f"Invalid pgrep output for parent PID {parent_pid}: {result.stdout.strip()}"
-            )
-            # 不正な出力を呼び出し元へ伝える。
-            return None
-        # 子PID一覧を返す。
-        return child_pids
-
-    # 装置ごとにDataGeneratorの子プロセス数を確認する。
-    def check_equip(self, equip_info):
-        # 装置識別情報をログに出力する。
-        self.log_info(
-            "- Name: {} / Type: {} / S/N: {}".format(
-                equip_info["tool_id"],
-                equip_info["machine_type"],
-                equip_info["serial_num"],
-            )
-        )
-        # pid_listから対象装置の親PID一覧を取得する。
-        parent_pids = self.get_parent_pids(equip_info["tool_id"])
-        # 装置に紐づく子PIDを格納する。
-        child_pids = set()
-        # 親プロセスごとに子プロセス数を確認する。
-        for parent_pid in parent_pids:
-            # 親プロセスの子PID一覧をpgrepで取得する。
-            parent_children = self.get_child_pids(parent_pid)
-            # pgrepが失敗した場合に次の親プロセスへ進む。
-            if parent_children is None:
-                # 次の親プロセスを確認する。
-                continue
-            # 親PIDごとの子プロセス数を記録する。
-            self.log_info(
-                f"    Parent PID: {parent_pid} / DataGenerator child count: {len(parent_children)}"
-            )
-            # 取得した子PIDを装置の一覧に追加する。
-            child_pids.update(parent_children)
-        # 子プロセスが複数ある場合に重複を記録する。
-        if len(child_pids) > 1:
-            # 重複状態を記録する。
-            self._duplicate_found = True
-            # 重複した装置と子PID一覧をエラー出力する。
-            self.log_error(
-                "DUPLICATE DataGenerator processes: TOOL_ID={} count={} child PIDs={}".format(
-                    equip_info["tool_id"],
-                    len(child_pids),
-                    ",".join(sorted(child_pids, key=int)),
-                )
-            )
-        # 子プロセスが1つ以下の場合に確認結果を記録する。
-        else:
-            # 子PIDがない場合に正常状態を記録する。
-            self.log_info(f"    DataGenerator child count: {len(child_pids)}")
-
-    # 重複が発生した場合に全装置のMDASを再起動する。
-    def restart_all_mdas(self):
-        # 全装置を対象に非対話モードで再起動するコマンドを組み立てる。
-        command = [MDAS_ACTIVATION_SCRIPT, "-a", "-y"]
-        # 全装置の再起動開始をログに出力する。
-        self.log_warn("Restarting MDAS for all equipment using mdas_activation.sh")
-        # MDAS起動スクリプトを実行する。
-        try:
-            # 標準出力と標準エラーを取得して起動結果を確認する。
-            result = subprocess.run(
-                command,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                text=True,
-                check=False,
-            )
-        # activationスクリプトを実行できない場合にエラーを記録する。
-        except OSError as error:
-            # 全装置の再起動コマンド失敗をログに出力する。
-            self.log_error(f"Cannot restart all MDAS equipment: {error}")
-            # 再起動処理を終了する。
-            return
-        # 起動スクリプトの標準出力をログに記録する。
-        if result.stdout.strip():
-            # 標準出力をINFOログに出力する。
-            self.log_info(result.stdout.strip())
-        # 起動スクリプトの標準エラーをログに記録する。
-        if result.stderr.strip():
-            # 標準エラーをWARNログに出力する。
-            self.log_warn(result.stderr.strip())
-        # 再起動に失敗した場合にエラーを記録する。
-        if result.returncode != 0:
-            # 終了コードを含めて再起動失敗を記録する。
-            self.log_error(
-                f"MDAS restart failed for all equipment with exit code {result.returncode}"
-            )
-            # 再起動成功処理へ進まない。
-            return
-        # 再起動成功をログに記録する。
-        self.log_info("MDAS restart completed for all equipment")
-
-    # 全装置の確認を実行する。
-    def main(self):
-        # 重複確認の開始をログに出力する。
-        self.log_info(
-            "==================== Check DataGenerator duplicates ===================="
-        )
-        # MachineListから全装置情報を取得する。
-        equip_list = self.get_equip_info()
-        # 装置ごとに重複確認を実行する。
-        for equip_info in equip_list:
-            # 対象装置の子プロセス数を確認する。
-            self.check_equip(equip_info)
-        # 重複が見つかった場合に全装置のMDASを再起動する。
-        if self._duplicate_found:
-            # 全装置のMDAS再起動を実行する。
-            self.restart_all_mdas()
-            # 重複状態を終了コード1で返す。
-            return 1
-        # エラーが発生した場合にエラー終了コードを返す。
-        if self._error_found:
-            # エラー状態を終了コード2で返す。
-            return 2
-        # 問題がない場合に正常終了コードを返す。
-        return 0
-
-    # ログファイルを閉じて確認を終了する。
-    def close(self):
-        # ログファイルを閉じる。
-        self._log_file.close()
-
-
-# 直接実行された場合に確認処理を開始する。
-if __name__ == "__main__":
-    # 確認処理インスタンスを生成する。
-    checker = DuplicateChecker()
-    # 確認処理後に必ずログファイルを閉じる。
-    try:
-        # 確認結果を取得する。
-        exit_code = checker.main()
-    # 例外発生時もログファイルを閉じる。
-    finally:
-        # ログファイルを閉じる。
-        checker.close()
-    # 確認結果を終了コードとして返す。
-    sys.exit(exit_code)
-
-
-
-
-
-－－－－－－－－－－－－－－－－－－－－－－－－－－－－－－－－－－－－－－－－－－－－－－－－－－－－－－－－－－－－－－－－－－－－－－－－－－－－－－－－－－－－－－－－－－－－－－－－－－－－---------
-
-#!/usr/bin/env python3
-"""
-MDASサーバーのI/O停滞調査用プローブ（Python 3標準ライブラリのみ）。
-
-目的
-====
-DataGeneratorの重複はI/O停滞の二次被害である可能性があるため、
-重複検知時だけでなく平常時から、プロセス単位のI/Oカウンターと
-ホスト／ブロックデバイスの累積カウンターを同じ時刻軸で記録する。
-出力先は /var/log/freeze_probe。10秒ごとに /proc を読み、日付別TSVへ追記する。
-
-AI解析時の観点
-==============
-1. process-*.tsv の同一 pid + start_ticks を1プロセスとして追跡する。
-   PIDだけでは終了後に再利用される可能性がある。
-2. event が io_delta の行を調べ、delta_read_bytes / delta_write_bytes
-   が大きいプロセスとその時間帯を特定する。rchar / wchar はキャッシュ経由を
-   含むため、実ストレージI/O量の目安は read_bytes / write_bytes を優先する。
-   初回観測値は全プロセス分を出力せず、初回観測がD状態の場合だけ
-   blocked_D行に累積値を記録する。io_delta行は以降のカウンター差分を表す。
-3. event=blocked_D は、そのサンプル時点で割り込み不能状態(D)だったことを示す。
-   wchan と delayacct_blkio_ticks の変化を参照する。D状態だけでディスク待ちと
-   断定せず、pressure-io、device、kernelログと照合する。
-4. device-*.tsv はデバイス単位の累積カウンター。隣接サンプルの差をとり、
-   I/O量、完了要求数、in_flight、処理時間の増加を比較する。
-   /proc/diskstatsのセクターは通常512バイト。デバイスマッパー等の階層を
-   またいで値を単純合算すると同じI/Oを重複計上する場合がある。
-5. host-*.tsv の pressure-io はI/O待ちの影響、procs_blockedはブロック中数、
-   meminfo/vmstatはメモリ回収・スワップ・writeback等を確認する。
-   同一時刻近辺でプロセス差分、デバイス差分、I/O圧力、メモリ状況を突き合わせる。
-6. PIDごとのI/Oバイト数はデバイス占有時間や要求ごとの遅延ではない。
-   writeback、swap、RAID/multipath、NFS/SAN/仮想基盤などでは発行元が一対一に
-   対応しない場合がある。ホスト記録で説明できなければ、それらの層の同時刻の
-   ログ・統計も必要。短命プロセスは10秒ポーリングの間に終了すると見逃し得る。
-
-運用上の注意
-============
-rootで起動する（/proc/<PID>/io等の権限と網羅性のため）。コマンドラインや
-環境変数は秘密情報を含み得るため記録しない。/procの読み取りは通常ディスク
-読み取りではないが、プロセス数に応じたCPU負荷と、TSV追記のディスク書き込みは
-発生する。強制fsyncや全ログの毎回出力は行わず、収集間隔は10秒とする。
-
-保存先が障害対象と同じディスクの場合、ディスク停滞中はログ書き込みも遅れたり
-失敗したりする。この制約はスクリプトでは解消できない。ログ容量を定期確認し、
-運用側で保管期間を決めて古い日付ファイルを削除する。障害調査中のファイルは
-解析・回収が終わるまで削除しない。実運用前にテスト環境で負荷と出力量を確認する。
-
-ログ
-====
-host-YYYYMMDD.tsv:
-  timestamp, monotonic_seconds, source, key, value
-  ホスト状態の選択したカウンター。カウンター系は差分で読む。
-device-YYYYMMDD.tsv:
-  timestamp, monotonic_seconds, major, minor, device, fields
-  fieldsは /proc/diskstats のデバイス名以降の数値列を順番通り保存する。
-  Linuxカーネルにより列数が異なることがあるため、値の意味は上記と
-  AlmaLinux 9.7のカーネルが提供する /proc/diskstats の定義に沿って解釈する。
-process-YYYYMMDD.tsv:
-  timestamp, monotonic_seconds, pid, start_ticks, comm, exe, ppid, state,
-  wchan, event, delta/cumulative I/Oカウンター, blkio_ticks
-  イベント行のみ出力する。初回観測値は通常出力しないため、
-  監視開始前からの累積値を差分と誤認することがない。
-errors-YYYYMMDD.tsv:
-  読み取り権限や/procエントリ消失など、収集時の問題。
-"""
-
-import datetime
-import os
-import sys
-import time
-
-
-OUTPUT_DIR = "/var/log/freeze_probe"
-INTERVAL_SECONDS = 10
-
-PROCESS_COUNTERS = (
-    "rchar",
-    "wchar",
-    "read_bytes",
-    "write_bytes",
-    "syscr",
-    "syscw",
-    "cancelled_write_bytes",
-)
-
-MEMINFO_KEYS = (
-    "MemTotal",
-    "MemFree",
-    "MemAvailable",
-    "Buffers",
-    "Cached",
-    "SwapCached",
-    "Active(file)",
-    "Inactive(file)",
-    "Dirty",
-    "Writeback",
-    "Slab",
-    "SReclaimable",
-    "SwapTotal",
-    "SwapFree",
-)
-
-VMSTAT_KEYS = (
-    "pswpin",
-    "pswpout",
-    "pgmajfault",
-    "pgscan_kswapd",
-    "pgscan_direct",
-    "pgsteal_kswapd",
-    "pgsteal_direct",
-    "allocstall",
-    "allocstall_dma",
-    "allocstall_dma32",
-    "allocstall_normal",
-    "allocstall_movable",
-    "nr_dirty",
-    "nr_writeback",
-    "oom_kill",
-)
-
-HOST_HEADER = "timestamp\tmonotonic_seconds\tsource\tkey\tvalue\n"
-DEVICE_HEADER = (
-    "timestamp\tmonotonic_seconds\tmajor\tminor\tdevice\tfields\n"
-)
-PROCESS_HEADER = (
-    "timestamp\tmonotonic_seconds\tpid\tstart_ticks\tcomm\texe\tppid\t"
-    "state\twchan\tevent\tdelta_rchar\tdelta_wchar\tdelta_read_bytes\t"
-    "delta_write_bytes\tdelta_syscr\tdelta_syscw\t"
-    "delta_cancelled_write_bytes\trchar\twchar\tread_bytes\twrite_bytes\t"
-    "syscr\tsyscw\tcancelled_write_bytes\tblkio_ticks\tdelta_blkio_ticks\n"
-)
-ERROR_HEADER = "timestamp\tmonotonic_seconds\tsource\terror\n"
-
-
-def timestamp():
-    """ローカルタイムゾーン付き時刻を秒精度で返す。"""
-    return datetime.datetime.now().astimezone().isoformat(timespec="seconds")
-
-
-def current_day():
-    return datetime.datetime.now().strftime("%Y%m%d")
-
-
-def tsv(value):
-    """TSVの列を壊さないようタブ・改行を置換する。"""
-    return str(value).replace("\t", " ").replace("\r", " ").replace("\n", " ")
-
-
-def append_batch(filename, header, rows):
-    """一回のサンプル分をまとめて追記し、毎行の書き込みを避ける。"""
-    if not rows:
-        return
-    path = os.path.join(OUTPUT_DIR, filename)
-    new_file = not os.path.exists(path)
-    with open(path, "a", encoding="utf-8") as output:
-        if new_file:
-            output.write(header)
-        output.writelines(rows)
-
-
-def read_proc_file(path):
-    with open(path, "r", encoding="utf-8", errors="replace") as source:
-        return source.read()
-
-
-def parse_key_values(path):
-    values = {}
-    for line in read_proc_file(path).splitlines():
-        fields = line.split()
-        if len(fields) >= 2:
-            values[fields[0].rstrip(":")] = fields[1]
-    return values
-
-
-def record_error(errors, ts, mono, source, error):
-    errors.append(
-        "\t".join((ts, f"{mono:.3f}", tsv(source), tsv(error))) + "\n"
-    )
-
-
-def collect_host(ts, mono, errors):
-    rows = []
-
-    def add(source, key, value):
-        rows.append(
-            "\t".join((ts, f"{mono:.3f}", source, tsv(key), tsv(value))) + "\n"
-        )
-
-    # CPU累積値、実行中・ブロック中プロセス数、コンテキスト切替等。
-    try:
-        for line in read_proc_file("/proc/stat").splitlines():
-            parts = line.split()
-            if parts and (
-                parts[0].startswith("cpu")
-                or parts[0] in ("procs_running", "procs_blocked", "ctxt", "processes")
-            ):
-                add("stat", parts[0], " ".join(parts[1:]))
-    except OSError as error:
-        record_error(errors, ts, mono, "/proc/stat", error)
-
-    # メモリ、ページ回収、スワップに関連する値のみを記録してログ量を抑える。
-    for source, path, selected in (
-        ("meminfo", "/proc/meminfo", set(MEMINFO_KEYS)),
-        ("vmstat", "/proc/vmstat", set(VMSTAT_KEYS)),
-    ):
-        try:
-            values = parse_key_values(path)
-            for key in selected:
-                if key in values:
-                    add(source, key, values[key])
-        except OSError as error:
-            record_error(errors, ts, mono, path, error)
-
-    # PSIが利用可能なカーネルでは、I/O待ちで失われた時間の割合を記録する。
-    try:
-        for line in read_proc_file("/proc/pressure/io").splitlines():
-            parts = line.split()
-            if parts:
-                add("pressure-io", parts[0], " ".join(parts[1:]))
-    except FileNotFoundError:
-        add("pressure-io", "availability", "unavailable")
-    except OSError as error:
-        record_error(errors, ts, mono, "/proc/pressure/io", error)
-
-    # ロード平均と実行・総プロセス数を記録する。
-    try:
-        add("loadavg", "values", read_proc_file("/proc/loadavg").strip())
-    except OSError as error:
-        record_error(errors, ts, mono, "/proc/loadavg", error)
-
-    return rows
-
-
-def collect_devices(ts, mono, errors):
-    rows = []
-    try:
-        for line in read_proc_file("/proc/diskstats").splitlines():
-            fields = line.split()
-            if len(fields) >= 4:
-                major, minor, device = fields[:3]
-                counters = fields[3:]
-                rows.append(
-                    "\t".join(
-                        (
-                            ts,
-                            f"{mono:.3f}",
-                            major,
-                            minor,
-                            tsv(device),
-                            " ".join(counters),
-                        )
-                    )
-                    + "\n"
-                )
-    except OSError as error:
-        record_error(errors, ts, mono, "/proc/diskstats", error)
-    return rows
-
-
-def parse_process_stat(text):
-    """comm内の空白や括弧を考慮して /proc/PID/stat を解析する。"""
-    close = text.rfind(")")
-    if close < 0:
-        raise ValueError("malformed process stat")
-    comm = text[text.find("(") + 1 : close]
-    fields = text[close + 2 :].split()
-    if len(fields) <= 19:
-        raise ValueError("process stat has too few fields")
-    state = fields[0]
-    ppid = fields[1]
-    start_ticks = fields[19]  # field 22 (starttime); fields starts at field 3.
-    blkio_ticks = fields[39] if len(fields) > 39 else ""
-    return comm, state, ppid, start_ticks, blkio_ticks
-
-
-def read_process(proc_name):
-    base = os.path.join("/proc", proc_name)
-    comm, state, ppid, start_ticks, blkio_ticks = parse_process_stat(
-        read_proc_file(os.path.join(base, "stat"))
-    )
-
-    io_values = {}
-    for line in read_proc_file(os.path.join(base, "io")).splitlines():
-        key, value = line.split(":", 1)
-        io_values[key] = int(value.strip())
-
-    try:
-        exe = os.readlink(os.path.join(base, "exe"))
-    except OSError:
-        exe = ""
-    try:
-        wchan = read_proc_file(os.path.join(base, "wchan")).strip()
-    except OSError:
-        wchan = ""
-
-    return {
-        "pid": int(proc_name),
-        "comm": comm,
-        "exe": exe,
-        "ppid": ppid,
-        "state": state,
-        "start_ticks": start_ticks,
-        "blkio_ticks": blkio_ticks,
-        "wchan": wchan,
-        "io": io_values,
-    }
-
-
-def process_row(ts, mono, process, event, deltas=None):
-    deltas = deltas or {}
-    io_values = process["io"]
-    fields = [
-        ts,
-        f"{mono:.3f}",
-        process["pid"],
-        process["start_ticks"],
-        tsv(process["comm"]),
-        tsv(process["exe"]),
-        process["ppid"],
-        process["state"],
-        tsv(process["wchan"]),
-        event,
-    ]
-    fields.extend(deltas.get(key, "") for key in PROCESS_COUNTERS)
-    fields.extend(io_values.get(key, "") for key in PROCESS_COUNTERS)
-    fields.append(process["blkio_ticks"])
-    fields.append(deltas.get("blkio_ticks", ""))
-    return "\t".join(map(str, fields)) + "\n"
-
-
-def collect_processes(ts, mono, previous, errors):
-    current = {}
-    rows = []
-
-    try:
-        entries = os.listdir("/proc")
-    except OSError as error:
-        record_error(errors, ts, mono, "/proc", error)
-        return current, rows
-
-    for proc_name in entries:
-        if not proc_name.isdigit():
-            continue
-        try:
-            process = read_process(proc_name)
-        except (FileNotFoundError, ProcessLookupError):
-            # プロセス終了と採取が競合した場合は、次回の消失判定に任せる。
-            continue
-        except PermissionError as error:
-            record_error(errors, ts, mono, f"/proc/{proc_name}", error)
-            continue
-        except (OSError, ValueError, IndexError) as error:
-            record_error(errors, ts, mono, f"/proc/{proc_name}", error)
-            continue
-
-        identity = (process["pid"], process["start_ticks"])
-        current[identity] = process
-        old = previous.get(identity)
-
-        if old is None:
-            # 初回値は監視開始前からの累積かもしれないため、差分扱いしない。
-            if process["state"] == "D":
-                rows.append(process_row(ts, mono, process, "blocked_D"))
-            continue
-
-        deltas = {
-            key: process["io"].get(key, 0) - old["io"].get(key, 0)
-            for key in PROCESS_COUNTERS
-        }
-        delta_ticks = ""
-        if process["blkio_ticks"] and old["blkio_ticks"]:
-            try:
-                delta_ticks = int(process["blkio_ticks"]) - int(old["blkio_ticks"])
-            except ValueError:
-                delta_ticks = ""
-        deltas["blkio_ticks"] = delta_ticks
-
-        if any(value != 0 for value in deltas.values()):
-            rows.append(process_row(ts, mono, process, "io_delta", deltas))
-        if process["state"] == "D":
-            # D状態が続いたサンプルを残し、継続時間の下限を把握できるようにする。
-            rows.append(process_row(ts, mono, process, "blocked_D", deltas))
-        elif process["state"] != old["state"]:
-            rows.append(process_row(ts, mono, process, "state_change", deltas))
-
-    # 終了したプロセスの最終累積値を、正しい列位置で記録する。
-    # 終了が観測された時刻は実際の終了時刻ではなく、前回採取以降の範囲である。
-    for identity, process in previous.items():
-        if identity not in current:
-            rows.append(process_row(ts, mono, process, "exit_observed"))
-
-    return current, rows
-
-
-def write_metadata():
-    path = os.path.join(OUTPUT_DIR, "metadata.txt")
-    if os.path.exists(path):
-        return
-    try:
-        clk_tck = os.sysconf("SC_CLK_TCK")
-    except (ValueError, OSError):
-        clk_tck = "unavailable"
-    try:
-        delayacct = read_proc_file("/proc/sys/kernel/task_delayacct").strip()
-    except OSError:
-        delayacct = "unavailable"
-
-    details = [
-        "Freeze probe metadata",
-        f"started_at={timestamp()}",
-        f"hostname={os.uname().nodename}",
-        f"kernel={os.uname().release}",
-        f"python={sys.version.split()[0]}",
-        f"interval_seconds={INTERVAL_SECONDS}",
-        f"clk_tck={clk_tck}",
-        f"task_delayacct={delayacct}",
-        "Run as root to maximize /proc process I/O visibility.",
-        "No process command lines or environment variables are collected.",
-    ]
-    with open(path, "x", encoding="utf-8") as output:
-        output.write("\n".join(details) + "\n")
-
-
-def main():
-    os.makedirs(OUTPUT_DIR, mode=0o700, exist_ok=True)
-    os.umask(0o077)
-    write_metadata()
-    previous = {}
-
-    while True:
-        cycle_start = time.monotonic()
-        ts = timestamp()
-        mono = time.monotonic()
-        errors = []
-
-        host_rows = collect_host(ts, mono, errors)
-        device_rows = collect_devices(ts, mono, errors)
-        current, process_rows = collect_processes(
-            ts, mono, previous, errors
-        )
-
-        day = current_day()
-        append_batch(f"host-{day}.tsv", HOST_HEADER, host_rows)
-        append_batch(f"device-{day}.tsv", DEVICE_HEADER, device_rows)
-        append_batch(f"process-{day}.tsv", PROCESS_HEADER, process_rows)
-        append_batch(
-            f"errors-{day}.tsv", ERROR_HEADER, errors
-        )
-
-        previous = current
-        elapsed = time.monotonic() - cycle_start
-        time.sleep(max(0, INTERVAL_SECONDS - elapsed))
-
-
-if __name__ == "__main__":
-    main()
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-－－－－－－－－－－－－－－－－－－－－－－－－－－－－－－－－－－－－－－－－－－－－－－－－－－－－－－－－－－－－－－－－－－－－－－－－－－－－－－－－－－－－－－－－－－－－－－－－－－－－---------
-
-
-
-
-'''
----------------------------------------------
-Copyright(C) Canon Inc. All right reserved.
----------------------------------------------
-'''
-import socket
-import select
-import json
-import os
-import loggerForEsprit
-
-POLLING_TIMEOUT_ENV = 'MDAS_REQUE_RESPONSE_TIMEOUT_SEC'
-DEFAULT_POLLING_TIMEOUT_SEC = 20
-MIN_POLLING_TIMEOUT_SEC = 1
-MAX_POLLING_TIMEOUT_SEC = 3600
-
-class ScriptSender():
-    INT32_BYTES = 4
-
-    def __init__(self, service):
-        self.port = socket.getservbyname(service, 'tcp')
-        self.logger = loggerForEsprit.getLogger()
-        timeout_sec = os.environ.get(POLLING_TIMEOUT_ENV)
-        if timeout_sec is None:
-            self.logger.info(
-                '%s is not set; using default timeout of %d seconds',
-                POLLING_TIMEOUT_ENV,
-                DEFAULT_POLLING_TIMEOUT_SEC,
-            )
-            timeout_sec = DEFAULT_POLLING_TIMEOUT_SEC
-        else:
-            try:
-                timeout_sec = int(timeout_sec)
-            except ValueError:
-                timeout_sec = None
-
-            if timeout_sec is None or not MIN_POLLING_TIMEOUT_SEC <= timeout_sec <= MAX_POLLING_TIMEOUT_SEC:
-                self.logger.warning(
-                    'Invalid %s value; using default timeout of %d seconds',
-                    POLLING_TIMEOUT_ENV,
-                    DEFAULT_POLLING_TIMEOUT_SEC,
-                )
-                timeout_sec = DEFAULT_POLLING_TIMEOUT_SEC
-
-        self.polling_timeout_ms = timeout_sec * 1000
-
-    def send(self, mode, script):
-        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
-
-            # ��³����
-            sock.connect((socket.gethostname(), self.port))
-            self.logger.info("==sock.connect port: %d" % self.port)
-
-            # �׵����������
-            self._send_data(sock, mode, script)
-            self.logger.info("==sock._send_data mode: %s, script: %s" % (mode, script))
-            sock.shutdown(socket.SHUT_WR)
-            self.logger.info("==sock.shutdown")
-
-            # ��������
-            return self._recv_data(sock)
-
-    def _send_data(self, sock, mode, script):
-        bin = script.encode('utf-8')
-        size = len(bin) + ScriptSender.INT32_BYTES
-
-        sock.sendall(size.to_bytes(ScriptSender.INT32_BYTES, 'big'))
-        sock.sendall(mode.to_bytes(ScriptSender.INT32_BYTES, 'big'))
-        sock.sendall(bin)
-
-    def _recv_data(self, sock):
-        size = self._recv_int32(sock)
-        body = self._recv_binary(sock, size)
-        self.logger.info("==sock._recv_data size: %d, body: %s" % (size, body))
-        return json.loads(body.decode('utf-8'))
-
-    def _recv_binary(self, sock, size):
-        poll = select.poll()
-        poll.register(sock, select.POLLIN)
-
-        data = b''
-        while len(data) < size:
-            ### SST000-01542 add timeout
-            ready = poll.poll(self.polling_timeout_ms)
-            if not ready:
-                ### SST000-01542 raise timeout error
-                raise TimeoutError('Timeout of poll.poll().')
-
-            remine = size - len(data)
-
-            d1 = sock.recv(remine)
-            if len(d1) == 0:
-                raise Exception('disconnect.')
-
-            data += d1
-
-        return data
-
-    def _recv_int32(self, sock):
-        data = self._recv_binary(sock, ScriptSender.INT32_BYTES)
-        return int.from_bytes(data, 'big')
-
-
-
-
-
-－－－－－－－－－－－－－－－－－－－－－－－－－－－－－－－－－－－－－－－－－－－－－－－－－－－－－－－－－－－－－－－－－－－－－－－－－－－－－－－－－－－－－－－－－－－－－－－－－－－－--------------------
-
-
-MDAS の対象ホストが systemd を使う構成なら、常駐 service ではなく Type=oneshot の service と timer を組み合わせるのがよいです。timer が毎日 00:40 に service を起動し、flock で同じ処理の重複起動を防ぎます。
-
----
-# /etc/systemd/system/mdas-daily-job.service
-[Unit]
-Description=MDAS daily job
-
-[Service]
-Type=oneshot
-User=ifour
-WorkingDirectory=/console/mdas
-RuntimeDirectory=mdas-daily-job
-ExecStart=/usr/bin/flock -n /run/mdas-daily-job/lock /console/mdas/bin/対象のスクリプト.sh
----
----
-# /etc/systemd/system/mdas-daily-job.timer
-[Unit]
-Description=Run MDAS daily job at 00:40
-
-[Timer]
-OnCalendar=*-*-* 00:40:00
-AccuracySec=1s
-Unit=mdas-daily-job.service
-
-[Install]
-WantedBy=timers.target
----
-反映・有効化と確認は次のとおりです。
----
-sudo systemctl daemon-reload
-sudo systemctl start mdas-daily-job.service  # まず手動で動作確認
-sudo systemctl enable --now mdas-daily-job.timer
-systemctl list-timers mdas-daily-job.timer
-journalctl -u mdas-daily-job.service
----
-flock -n がロックを取れない場合は、2つ目の起動をせず終了します。その場合は systemd 上で service が失敗扱いになるため、ログで「重複によるスキップ」と実際の処理失敗を区別したい場合は、ロック競合を正常終了に変換するラッパーを用意します。また、スクリプトを service 以外から直接実行する経路があるなら、その経路にも同じロックを適用してください。
-
-このリポジトリでは、現在の cron 登録は 6300ES6a_cron にあり、Installer の Makefile はその設定をインストール成果物へコピーしています。移行時は、対象処理の cron 登録を外して二重スケジュールを避け、service/timer の unit ファイルを同じインストーラー経路で配置・有効化するのがよいです。実際のスクリプトは User=ifour で環境変数や権限が足りるか確認してください。既存の例 executor_ErrorEvent_cron.sh は、cron 起動時の環境設定を独自に読み込んでいます。
-
-なお、timer の Persistent=true を追加すると、停止中に実行時刻を逃した場合、起動後に実行します。再起動後の追いつき実行が必要な場合だけ有効にしてください。
+----------------------------------------------------------------------------------------------------
+Client.cpp
+----------------------------------------------------------------------------------------------------
+/**
+ * @file    Client.cpp
+ * @author  Copyright(C) Canon Inc. All right reserved.
+ * @date    2014/01/10
+ * @brief   クライアントクラス
+ * @par     説明
+ *  - TCP通信のクライアント機能を実現するクラス
+ */
+#include <cstring>
+#include "I_ClientTcpIo.hpp"
+#include "Client.hpp"
+#include "TcpUtil.hpp"
+
+/**
+ * @brief        コンストラクタ
+ */
+Client::Client(void)
+{
+	client_.local.addr_len = sizeof(client_.local.addr);
+	client_.remote.addr_len = sizeof(client_.remote.addr);
+}
+
+Client::Client(in_addr hostInfo, int portInfo)
+{
+	client_.remote.addr.sin_family = AF_INET;
+	client_.remote.addr.sin_port = portInfo;
+	client_.remote.addr.sin_addr = hostInfo;
+	client_.local.addr_len = sizeof(client_.local.addr);
+	client_.remote.addr_len = sizeof(client_.remote.addr);
+}
+
+/**
+ * @brief        デストラクタ
+ */
+Client::~Client()
+{
+}
+
+/**
+ * @brief        初期化処理
+ * @param[in]    host        ホスト名
+ * @param[in]    service     サービス名
+ * @param[out]   hostInfo    IPアドレス情報
+ * @param[out]   portInfo    ポート番号情報
+ *
+ * @retval       なし
+ */
+void Client::TcpInit(const char *host, const char *service, in_addr *hostInfo, int *portInfo)
+{
+	log_printf(LV_DEBUG, "start\n");
+
+	try
+	{
+		// ホスト名からIPアドレスを取得
+		if (hostInfo->s_addr == 0)
+		{
+			tcpGetHostByName(host, hostInfo);
+			log_printf(LV_DEBUG, "hostname = %s, hostInfo = %d\n", host, hostInfo->s_addr);
+		}
+
+		// サービス名からポート番号を取得
+		if (*portInfo == 0)
+		{
+			tcpGetServiceByName(service, portInfo);
+			log_printf(LV_DEBUG, "service = %s, portInfo = %d\n", service, *portInfo);
+		}
+
+		client_.remote.addr.sin_family = AF_INET;
+		client_.remote.addr.sin_port = *portInfo;
+		client_.remote.addr.sin_addr.s_addr = hostInfo->s_addr;
+
+		log_printf(LV_DEBUG, "hostInfo = %d\n", client_.remote.addr.sin_addr.s_addr);
+		log_printf(LV_DEBUG, "portInfo = %d\n", client_.remote.addr.sin_port);
+		log_printf(LV_DEBUG, "len      = %d\n", client_.remote.addr_len);
+	}
+	catch (int error)
+	{
+		log_printf(LV_ERROR, "error.(0x%x)\n", error);
+		throw error;
+	}
+	catch (...)
+	{
+		log_printf(LV_ERROR, "error.\n");
+		throw -1;
+	}
+
+	log_printf(LV_DEBUG, "end\n");
+
+	return;
+}
+
+/**
+ * @brief        サーバ接続
+ * @param[inout] sd          ソケットディスクリプタ
+ * @param[in]    connect     接続タイプ(0:常時接続型/1:毎回接続型)
+ *
+ * @retval       なし
+ */
+void Client::TcpConnect(int *sd, int connect)
+{
+	int err = 0;   ///< エラー戻り値
+	int sd_ = *sd; ///< ソケットディスクリプタ
+
+	log_printf(LV_DEBUG, "start\n");
+
+	// 常時接続型は初回時のみソケットを生成する
+	if ((connect == TCP_CONNECT) && (sd_ >= 0))
+	{
+		log_printf(LV_DEBUG, "sd(client:after socket) = %d\n", sd_);
+		log_printf(LV_DEBUG, "end(no exec.)\n");
+		return;
+	}
+
+	try
+	{
+		// ソケットを生成
+		sd_ = socket(AF_INET, SOCK_STREAM, 0);
+		if (sd_ < 0)
+		{
+			log_printf(LV_ERROR, "socket error.(sd = %d, errno = %d)\n", sd_, errno);
+			throw ERR_CLIENT_SYSTEM;
+		}
+		log_printf(LV_DEBUG, "sd(client:after socket) = %d\n", sd_);
+
+		// TIME_WAIT状態を回避する
+		struct linger optval;
+		optval.l_onoff = 1;
+		optval.l_linger = 0;
+		err = setsockopt(sd_, SOL_SOCKET, SO_LINGER, (void *)&optval, sizeof(optval));
+		if (err < 0)
+		{
+			throw ERR_CLIENT_SYSTEM;
+		}
+
+		//SST000-01635:Set tcp_nodelay for changing Nagle mode OFF(for avoid 40msec tcp delay) 
+		tcpConnect(sd_);
+
+		// サーバ接続
+		err = getsockname(sd_, (struct sockaddr *)&client_.local.addr, (SOCKLEN *)&client_.local.addr_len);
+		if (err < 0)
+		{
+			log_printf(LV_ERROR, "getsockname error.(err = %d, errno = %d)\n", err, errno);
+			throw ERR_CLIENT_GETSOCKNAME;
+		}
+		log_printf(LV_DEBUG, "local.sin_port = %d\n", client_.local.addr.sin_port);
+		log_printf(LV_DEBUG, "local.sin_addr = %d\n", client_.local.addr.sin_addr.s_addr);
+
+		// ローカルアドレスを取得
+		*sd = sd_;
+	}
+	catch (int error)
+	{
+		log_printf(LV_ERROR, "error.(0x%x)\n", error);
+		close(*sd); // ソケットディスクリプタを取得
+		throw error;
+	}
+	catch (...)
+	{
+		log_printf(LV_ERROR, "error.\n");
+		close(*sd); // ソケットディスクリプタを閉じておく
+		throw -1;
+	}
+
+	log_printf(LV_DEBUG, "end\n");
+
+	return;
+}
+
+/**
+ * @brief        サーバからのデータ読み込み
+ *               読み込みは1メッセージ
+ * @param[in]    sd          ソケットディスクリプタ
+ * @param[out]   size        返信データサイズ
+ * @param[out]   data        返信データ
+ * @param[out]   error       エラー情報
+ * @param[out]   header      ヘッダ(固定文字列)
+ * @param[out]   funcId      関数ID
+ * @param[out]   parity1     パリティ情報1
+ * @param[out]   parity2     パリティ情報2
+ *
+ * @retval       なし
+ */
+void Client::TcpRead(int sd, int *size, char **data, int *error, char *header, int *funcId, int *parity1, int *parity2)
+{
+	log_printf(LV_DEBUG, "start\n");
+
+	// 中間メッセージ、返信メッセージ共にヘッダは8バイトである。
+	// 最初に8バイトデータを読み込みヘッダ情報を取得する。
+	int headRecvSize = HEADER_SIZE;
+	char headData[HEADER_SIZE + 1];
+	memset(headData, 0, sizeof(headData));
+	tcpSelectRfs(sd, TIMEOUT);
+	tcpReadBytes(sd, headRecvSize, headData);
+
+	if (strncmp(headData, "InfmHead", sizeof(headData)) == 0)
+	{
+
+		// 中間メッセージを受信した場合、残りのデータを読み込む
+		// 関数ID(4)＋パリティ情報(8)＋エラー情報(4)＋中間フッタ(8)
+		S_TcpMsgC msgC;
+		memset(&msgC, 0, sizeof(msgC));
+		int restRecvSize = sizeof(msgC) - sizeof(msgC.header);
+		char *restData = new char[restRecvSize];
+		if (restData == NULL)
+		{
+			throw ERR_CLIENT_MALLOC;
+		}
+		memset(restData, 0, restRecvSize * sizeof(char));
+		tcpReadBytes(sd, restRecvSize, restData);
+		memcpy(&msgC.header, headData, headRecvSize);
+		memcpy(&msgC.funcId, restData, restRecvSize);
+		if (restData != NULL)
+		{
+			delete[] restData;
+			restData = NULL;
+		}
+		memcpy(header, headData, headRecvSize);
+		*funcId = ntohl(msgC.funcId);
+		*parity1 = ntohl(msgC.parity1);
+		*parity2 = ntohl(msgC.parity2);
+		*error = ntohl(msgC.error);
+	}
+	else if (strncmp(headData, "RecvHead", sizeof(headData)) == 0)
+	{
+
+		// 返信メッセージを受信した場合
+		// 関数ID(4)＋パリティ情報(8)＋データサイズ(4)＋エラー情報(4)＋返信データ(可変)＋返信フッタ(8)
+		// 1. エラー情報(4)までのデータを読み込む
+		S_TcpMsgE msgE;
+		memset(&msgE, 0, sizeof(msgE));
+		int fixRecvSize = sizeof(msgE.funcId) + sizeof(msgE.parity1) + sizeof(msgE.parity2) + sizeof(msgE.size) + sizeof(msgE.error);
+		char *fixData = new char[fixRecvSize];
+		if (fixData == NULL)
+		{
+			throw ERR_CLIENT_MALLOC;
+		}
+		memset(fixData, 0, fixRecvSize * sizeof(char));
+		tcpReadBytes(sd, fixRecvSize, fixData);
+		memcpy(&msgE.header, headData, headRecvSize);
+		memcpy(&msgE.funcId, fixData, fixRecvSize);
+		if (fixData != NULL)
+		{
+			delete[] fixData;
+			fixData = NULL;
+		}
+
+		// 2. 取得したデータサイズの情報を元に残りのデータを読み込む
+		msgE.size = ntohl(msgE.size);
+		if (msgE.size <= 0)
+		{
+			log_printf(LV_DEBUG, "parameter size is illegal.(%d)\n", msgE.size);
+			throw ERR_CLIENT_RECEIVE;
+		}
+		*size = msgE.size;
+		int restRecvSize = *size + sizeof(msgE.footer);
+		if (*data != NULL)
+		{
+			delete[] *data;
+			*data = NULL;
+		}
+		*data = new char[*size];
+		char *restData = new char[restRecvSize];
+		if ((*data == NULL) || (restData == NULL))
+		{
+			throw ERR_CLIENT_MALLOC;
+		}
+		memset(*data, 0, *size * sizeof(char));
+		memset(restData, 0, restRecvSize * sizeof(char));
+		tcpReadBytes(sd, restRecvSize, restData);
+		memcpy(*data, &restData[0], *size);
+		memcpy(&msgE.footer, &restData[*size], sizeof(msgE.footer));
+		if (restData != NULL)
+		{
+			// dataの領域解放は通常上位で行う
+			delete[] restData;
+			restData = NULL;
+		}
+		memcpy(header, headData, headRecvSize);
+		*funcId = ntohl(msgE.funcId);
+		*parity1 = ntohl(msgE.parity1);
+		*parity2 = ntohl(msgE.parity2);
+		*error = ntohl(msgE.error);
+	}
+	else
+	{
+		// ヘッダが見つからない
+		log_printf(LV_ERROR, "not find header error.(%s)\n", headData);
+		throw ERR_CLIENT_RECEIVE;
+	}
+
+	log_printf(LV_DEBUG, "header  = %s\n", header);
+	log_printf(LV_DEBUG, "funcId  = %d\n", *funcId);
+	log_printf(LV_DEBUG, "parity1 = %d\n", *parity1);
+	log_printf(LV_DEBUG, "parity2 = %d\n", *parity2);
+	log_printf(LV_DEBUG, "error   = %d\n", *error);
+
+	log_printf(LV_DEBUG, "end\n");
+
+	return;
+}
+
+/**
+ * @brief        サーバにデータ書き込み
+ * @param[in]    sd          ソケットディスクリプタ
+ * @param[in]    size        送信データサイズ
+ * @param[in]    data        送信データ
+ *
+ * @retval       なし
+ */
+void Client::TcpWrite(int sd, int size, char *data)
+{
+	log_printf(LV_DEBUG, "start\n");
+
+	// サーバにデータ書き込み
+	tcpSelectWfs(sd, TIMEOUT);
+	tcpWriteBytes(sd, size, data);
+
+	log_printf(LV_DEBUG, "end\n");
+
+	return;
+}
+
+/**
+ * @brief        サーバ切断
+ * @param[inout] sd          ソケットディスクリプタ
+ * @param[in]    connect     接続タイプ(0:常時接続型/1:毎回接続型)
+ *
+ * @retval       なし
+ */
+void Client::TcpClose(int *sd, int connect)
+{
+	int err = 0;   ///< エラー戻り値
+	int sd_ = *sd; ///< ソケットディスクリプタ
+
+	log_printf(LV_DEBUG, "start\n");
+
+	// 常時接続型は切断しない
+	if (connect == TCP_CONNECT)
+	{
+		log_printf(LV_DEBUG, "end(no exec.)\n");
+		return;
+	}
+
+	// 書き込みを閉じ、相手にFINを送る
+	// 相手からのFINを待たずに強制終了する
+	err = shutdown(sd_, SHUT_RDWR);
+	if (err < 0)
+	{
+		log_printf(LV_ERROR, "shutdown error.(err = %d, errno = %d)\n", err, errno);
+	}
+
+	// ソケットを閉じる
+	err = close(sd_);
+	if (err < 0)
+	{
+		log_printf(LV_ERROR, "close error.(err = %d, errno = %d)\n", err, errno);
+	}
+	log_printf(LV_DEBUG, "sd(client:after close) = %d\n", *sd);
+	*sd = -1;
+
+	log_printf(LV_DEBUG, "end\n");
+
+	return;
+}
+
+/**
+ * @brief        ホスト名からIPアドレスを取得
+ * @param[in]    host        ホスト名
+ * @param[out]   in_addr     IPアドレス(struct in_addr)
+ *
+ * @retval       なし
+ */
+void Client::tcpGetHostByName(const char *host, struct in_addr *in_addr)
+{
+	struct hostent *h_info; ///< hostent構造体
+
+	// ホスト名からIPアドレスを取得
+	h_info = gethostbyname(host);
+	if (h_info == NULL)
+	{
+		log_printf(LV_ERROR, "gethostbyname error.(%d)\n", errno);
+		throw ERR_CLIENT_GETHOSTBYNAME;
+	}
+	memcpy(&in_addr->s_addr, h_info->h_addr_list[0], h_info->h_length);
+	log_printf(LV_DEBUG, "h_length = %d\n", h_info->h_length);
+	log_printf(LV_DEBUG, "s_addr = %d\n", (int)in_addr->s_addr);
+
+	return;
+}
+
+/**
+ * @brief        サービス名からポート番号を取得
+ * @param[in]    service     サービス名
+ * @param[out]   port        ポート番号
+ *
+ * @retval       なし
+ */
+void Client::tcpGetServiceByName(const char *service, int *port)
+{
+	struct servent *se = NULL; ///< servent構造体
+
+	// サービス名からポート番号を取得
+	// プロトコルはTCP固定
+	se = getservbyname(service, "tcp");
+	if (se == NULL)
+	{
+		log_printf(LV_ERROR, "getservbyname error.(%d)\n", errno);
+		throw ERR_CLIENT_GETSERVBYNAME;
+	}
+	*port = se->s_port;
+	log_printf(LV_DEBUG, "service: %s, port:%d\n", service, *port);
+
+	return;
+}
+
+/**
+ * @brief        connect実行
+ * @param[in]    sd          ソケットディスクリプタ
+ *
+ * @retval       なし
+ */
+void Client::tcpConnect(int sd)
+{
+	int err = 0;		   ///< エラー戻り値
+	int connect_errno = 0; ///< 接続時のエラー情報
+
+	log_printf(LV_DEBUG, "start\n");
+
+	try
+	{
+		// ノンブロッキングモードに変更
+		tcpSetNonBlockingMode(sd);
+
+		// サーバ接続
+		err = connect(sd, (struct sockaddr *)&(client_.remote.addr), client_.remote.addr_len);
+		connect_errno = errno;
+		if (err == 0)
+		{
+			// サーバとクライアントが同一ホストの場合はこのタイミングでコネクションが確立するはず
+			// ブロッキングモードに戻す
+			tcpSetBlockingMode(sd);
+			log_printf(LV_DEBUG, "end\n");
+			return;
+		}
+		if (connect_errno != EINPROGRESS)
+		{
+			// サーバとクライアントが別ホストの場合は、コネクション確立を開始していればEINPROGRESSが返ってくるはず
+			log_printf(LV_ERROR, "connect error = %d\n", connect_errno);
+			throw ERR_CLIENT_CONNECT;
+		}
+
+		// select実行
+		tcpSelect(sd, CONNECT_TIMEOUT);
+
+		// ブロッキングモードに戻す
+		tcpSetBlockingMode(sd);
+	}
+	catch (int error)
+	{
+		// sdが取れた場合のみブロッキングモードに戻す
+		if (error != ERR_CLIENT_19)
+		{
+			tcpSetBlockingMode(sd);
+		}
+		log_printf(LV_ERROR, "error.(0x%x)\n", error);
+		throw error;
+	}
+	catch (...)
+	{
+		tcpSetBlockingMode(sd);
+		log_printf(LV_ERROR, "error.\n");
+		throw -1;
+	}
+
+	log_printf(LV_DEBUG, "end\n");
+
+	return;
+}
+
+/**
+ * @brief        select実行(読み込み可能待ち)
+ * @param[in]    sd          ソケットディスクリプタ
+ * @param[in]    timeout     タイムアウト時間 [sec]
+ *
+ * @retval       なし
+ */
+void Client::tcpSelectRfs(int sd, int timeout)
+{
+	int err = 0;	   ///< エラー戻り値
+	fd_set rfs;		   ///< ファイルディスクリプタ
+	struct timeval tv; ///< タイムアウト時間設定
+
+	log_printf(LV_DEBUG, "start\n");
+
+	try
+	{
+		FD_ZERO(&rfs);
+		FD_SET(sd, &rfs);
+
+		// セレクトのタイムアウト時間を設定
+		tv.tv_sec = timeout;
+		tv.tv_usec = 0;
+
+		// select()実行
+		if (timeout == -1)
+		{
+			err = select(sd + 1, &rfs, NULL, NULL, NULL); // タイムアウトなし
+		}
+		else
+		{
+			err = select(sd + 1, &rfs, NULL, NULL, &tv);
+		}
+		if (err == 0)
+		{
+			// タイムアウト
+			log_printf(LV_DEBUG, "select timeout.(%d)\n", (int)tv.tv_sec);
+			throw ERR_CLIENT_SELECT_TIMEOUT;
+		}
+		else if (err < 0)
+		{
+			log_printf(LV_ERROR, "select error.(err = %d, errno = %d)\n", err, errno);
+			throw ERR_CLIENT_SELECT;
+		}
+
+		// ファイルディスクリプタにデータあり
+		if (FD_ISSET(sd, &rfs))
+		{
+			int error_code;
+			int len = sizeof(error_code);
+			;
+
+			// ソケット中の保留のエラーを取得
+			err = getsockopt(sd, SOL_SOCKET, SO_ERROR, &error_code, (SOCKLEN *)&len);
+			if (err < 0)
+			{
+				log_printf(LV_ERROR, "getsockopt error.(err = %d, errno = %d)\n", err, errno);
+				throw ERR_CLIENT_GETSOCKOPT;
+			}
+
+			// 念のためエラーチェック
+			if (error_code != 0)
+			{
+				log_printf(LV_ERROR, "getsockopt error.(%d)\n", error_code);
+				throw ERR_CLIENT_GETSOCKOPT_2;
+			}
+		}
+		else
+		{
+			log_printf(LV_DEBUG, "socket not set.\n");
+			throw ERR_CLIENT_SELECT_NO_SOCKET;
+		}
+	}
+	catch (int error)
+	{
+		log_printf(LV_ERROR, "error.(0x%x)\n", error);
+		throw error;
+	}
+	catch (...)
+	{
+		log_printf(LV_ERROR, "error.\n");
+		throw -1;
+	}
+
+	log_printf(LV_DEBUG, "end\n");
+
+	return;
+}
+
+/**
+ * @brief        select実行(書き込み可能待ち)
+ * @param[in]    sd          ソケットディスクリプタ
+ * @param[in]    timeout     タイムアウト時間 [sec]
+ *
+ * @retval       なし
+ */
+void Client::tcpSelectWfs(int sd, int timeout)
+{
+	int err = 0;	   ///< エラー戻り値
+	fd_set wfs;		   ///< ファイルディスクリプタ
+	struct timeval tv; ///< タイムアウト時間設定
+
+	log_printf(LV_DEBUG, "start\n");
+
+	try
+	{
+		FD_ZERO(&wfs);
+		FD_SET(sd, &wfs);
+
+		// セレクトのタイムアウト時間を設定
+		tv.tv_sec = timeout;
+		tv.tv_usec = 0;
+
+		// select()実行
+		if (timeout == -1)
+		{
+			err = select(sd + 1, NULL, &wfs, NULL, NULL); // タイムアウトなし
+		}
+		else
+		{
+			err = select(sd + 1, NULL, &wfs, NULL, &tv);
+		}
+		if (err == 0)
+		{
+			// タイムアウト
+			log_printf(LV_DEBUG, "select timeout.(%d)\n", (int)tv.tv_sec);
+			throw ERR_CLIENT_SELECT_TIMEOUT;
+		}
+		else if (err < 0)
+		{
+			log_printf(LV_ERROR, "select error.(err = %d, errno = %d)\n", err, errno);
+			throw ERR_CLIENT_SELECT;
+		}
+
+		// ファイルディスクリプタにデータあり
+		if (FD_ISSET(sd, &wfs))
+		{
+			int error_code;
+			int len = sizeof(error_code);
+			;
+
+			// ソケット中の保留のエラーを取得
+			err = getsockopt(sd, SOL_SOCKET, SO_ERROR, &error_code, (SOCKLEN *)&len);
+			if (err < 0)
+			{
+				log_printf(LV_ERROR, "getsockopt error.(err = %d, errno = %d)\n", err, errno);
+				throw ERR_CLIENT_GETSOCKOPT;
+			}
+
+			// 念のためエラーチェック
+			if (error_code != 0)
+			{
+				log_printf(LV_ERROR, "getsockopt error.(%d)\n", error_code);
+				throw ERR_CLIENT_GETSOCKOPT_2;
+			}
+		}
+		else
+		{
+			log_printf(LV_DEBUG, "socket not set.\n");
+			throw ERR_CLIENT_SELECT_NO_SOCKET;
+		}
+	}
+	catch (int error)
+	{
+		log_printf(LV_ERROR, "error.(0x%x)\n", error);
+		throw error;
+	}
+	catch (...)
+	{
+		log_printf(LV_ERROR, "error.\n");
+		throw -1;
+	}
+
+	log_printf(LV_DEBUG, "end\n");
+
+	return;
+}
+
+/**
+ * @brief        select実行(読み書き可能待ち)
+ * @param[in]    sd          ソケットディスクリプタ
+ * @param[in]    timeout     タイムアウト時間 [sec]
+ *
+ * @retval       なし
+ */
+void Client::tcpSelect(int sd, int timeout)
+{
+	int err = 0;	   ///< エラー戻り値
+	fd_set rfs, wfs;   ///< ファイルディスクリプタ
+	struct timeval tv; ///< タイムアウト時間設定
+
+	log_printf(LV_DEBUG, "start\n");
+
+	try
+	{
+		// 読み書き両方をセレクトで待つ設定
+		FD_ZERO(&rfs);
+		FD_SET(sd, &rfs);
+		FD_ZERO(&wfs);
+		FD_SET(sd, &wfs);
+
+		// セレクトのタイムアウト時間を設定
+		tv.tv_sec = timeout;
+		tv.tv_usec = 0;
+
+		// select()実行
+		if (timeout == -1)
+		{
+			err = select(sd + 1, &rfs, &wfs, NULL, NULL); // タイムアウトなし
+		}
+		else
+		{
+			err = select(sd + 1, &rfs, &wfs, NULL, &tv);
+		}
+		if (err == 0)
+		{
+			// タイムアウト
+			log_printf(LV_DEBUG, "select timeout.(%d)\n", (int)tv.tv_sec);
+			throw ERR_CLIENT_SELECT_TIMEOUT;
+		}
+		else if (err < 0)
+		{
+			log_printf(LV_ERROR, "select error.(err = %d, errno = %d)\n", err, errno);
+			throw ERR_CLIENT_SELECT;
+		}
+
+		// 読み書きができれば接続完了
+		if (FD_ISSET(sd, &rfs) || FD_ISSET(sd, &wfs))
+		{
+			int error_code;
+			int len = sizeof(error_code);
+			;
+
+			// ソケット中の保留のエラーを取得
+			err = getsockopt(sd, SOL_SOCKET, SO_ERROR, &error_code, (SOCKLEN *)&len);
+			if (err < 0)
+			{
+				log_printf(LV_ERROR, "getsockopt error.(err = %d, errno = %d)\n", err, errno);
+				throw ERR_CLIENT_GETSOCKOPT;
+			}
+
+			// 念のためエラーチェック
+			if (error_code != 0)
+			{
+				log_printf(LV_ERROR, "getsockopt error.(%d)\n", error_code);
+				throw ERR_CLIENT_GETSOCKOPT_2;
+			}
+		}
+		else
+		{
+			log_printf(LV_DEBUG, "socket not set.\n");
+			throw ERR_CLIENT_SELECT_NO_SOCKET;
+		}
+	}
+	catch (int error)
+	{
+		log_printf(LV_ERROR, "error.(0x%x)\n", error);
+		throw error;
+	}
+	catch (...)
+	{
+		log_printf(LV_ERROR, "error.\n");
+		throw -1;
+	}
+
+	log_printf(LV_DEBUG, "end\n");
+
+	return;
+}
+
+/**
+ * @brief        ノンブロッキングモードに変更
+ * @param[in]    sd          ソケットディスクリプタ
+ *
+ * @retval       なし
+ */
+void Client::tcpSetNonBlockingMode(int sd)
+{
+	int flags; ///< fcntl戻り値
+
+	flags = fcntl(sd, F_GETFL, 0);
+	if (flags < 0)
+	{
+		log_printf(LV_ERROR, "fcntl error.(err = %d, errno = %d)\n", flags, errno);
+		throw ERR_CLIENT_FCNTL;
+	}
+
+	if (fcntl(sd, F_SETFL, flags | O_NONBLOCK))
+	{
+		log_printf(LV_ERROR, "fcntl error.(errno = %d)\n", errno);
+		throw ERR_CLIENT_FCNTL;
+	}
+
+	return;
+}
+
+/**
+ * @brief        ブロッキングモードに変更
+ * @param[in]    sd          ソケットディスクリプタ
+ *
+ * @retval       なし
+ */
+void Client::tcpSetBlockingMode(int sd)
+{
+	int flags; ///< fcntl戻り値
+
+	flags = fcntl(sd, F_GETFL, 0);
+	if (flags < 0)
+	{
+		log_printf(LV_ERROR, "fcntl error.(err = %d, errno = %d)\n", flags, errno);
+		throw ERR_CLIENT_FCNTL;
+	}
+
+	if (fcntl(sd, F_SETFL, flags & ~O_NONBLOCK))
+	{
+		log_printf(LV_ERROR, "fcntl error.(errno = %d)\n", errno);
+		throw ERR_CLIENT_FCNTL;
+	}
+
+	return;
+}
+
+/**
+ * @brief        指定したバイトだけデータを受信
+ * @param[in]    sd          ソケットディスクリプタ
+ * @param[in]    size        データサイズ
+ * @param[out]   data        受信データ
+ *
+ * @retval       なし
+ */
+void Client::tcpReadBytes(int sd, int size, char *data)
+{
+	int restSize = 0; ///< 残受信データサイズ
+	int nRecv = 0;	  ///< データ受信結果
+
+	log_printf(LV_DEBUG, "start\n");
+
+	// 指定サイズ受信できるまで繰り返し受信を行う
+	restSize = size;
+	while (restSize > 0)
+	{
+
+		log_printf(LV_DEBUG, "recv size(%d)\n", restSize);
+		nRecv = recv(sd, data, restSize, 0);
+		if (nRecv < 0)
+		{
+			// 受信エラー
+			log_printf(LV_ERROR, "recv error.(err = %d, errno = %d)\n", nRecv, errno);
+			throw ERR_CLIENT_RECV;
+		}
+		else if (nRecv == 0)
+		{
+			// 回線切断
+			log_printf(LV_ERROR, "connection closed error.\n");
+			throw ERR_CLIENT_RECV_DISCONNECT;
+		}
+		data += nRecv;
+		restSize -= nRecv;
+	}
+
+	log_printf(LV_DEBUG, "end\n");
+
+	return;
+}
+
+/**
+ * @brief        指定したバイトだけデータを送信
+ * @param[in]    sd          ソケットディスクリプタ
+ * @param[in]    size        データサイズ
+ * @param[in]    data        送信データ
+ *
+ * @retval       なし
+ */
+void Client::tcpWriteBytes(int sd, int size, char *data)
+{
+	int restSize = 0; ///< 残送信データサイズ
+	int nSend = 0;	  ///< データ送信結果
+
+	log_printf(LV_DEBUG, "start\n");
+
+	restSize = size;
+	while (restSize > 0)
+	{
+
+		// SIGPIPEの発生を抑止
+		log_printf(LV_DEBUG, "send size(%d)\n", restSize);
+		nSend = send(sd, data, restSize, 0);
+		if (nSend < 0)
+		{
+			// 送信エラー
+			log_printf(LV_ERROR, "send error.(err = %d, errno = %d)\n", nSend, errno);
+			throw ERR_CLIENT_SEND;
+		}
+		else if (nSend == 0)
+		{
+			// 回線切断
+			log_printf(LV_ERROR, "connection closed error.\n");
+			throw ERR_CLIENT_SEND_DISCONNECT;
+		}
+		data += nSend;
+		restSize -= nSend;
+	}
+
+	log_printf(LV_DEBUG, "end\n");
+
+	return;
+}
+
+
+----------------------------------------------------------------------------------------------------
+/**
+ * @file    Client.cpp
+ * @author  Copyright(C) Canon Inc. All right reserved.
+ * @date    2014/01/10
+ * @brief   クライアントクラス
+ * @par     説明
+ *  - TCP通信のクライアント機能を実現するクラス
+ */
+#include <cstring>
+#include "I_ClientTcpIo.hpp"
+#include "Client.hpp"
+#include "TcpUtil.hpp"
+
+// 目的: 受信・送信が複数回に分割されても、処理全体のタイムアウトが延びないようにする。
+// 処理: 指定秒数を現在時刻に加え、全ての部分送受信で共通して使う絶対期限を返す。
+// timeout == -1 の場合は期限を設けず、無制限待ちを表す。
+static struct timeval tcpCreateDeadline(int timeout)
+{
+	// 呼び出し元へ返す絶対期限を格納する。
+	struct timeval deadline;
+
+	// -1以外の負数は未定義値なので、誤った待ち時間として拒否する。
+	if (timeout < -1)
+	{
+		// 不正な設定値をログに残し、システムエラーとして呼び出し元へ返す。
+		log_printf(LV_ERROR, "invalid timeout.(%d)\n", timeout);
+		// 呼び出し元の通常エラー処理へ制御を移す。
+		throw ERR_CLIENT_SYSTEM;
+	}
+	// -1は無制限待ちなので、内部で判別できる特別な期限値を設定する。
+	if (timeout == -1)
+	{
+		// 秒を-1にして、無制限待ちであることを表す。
+		deadline.tv_sec = -1;
+		// timevalのマイクロ秒部分を初期化する。
+		deadline.tv_usec = 0;
+		// 無制限待ちの期限を返し、時刻取得による制限を行わない。
+		return deadline;
+	}
+	// 有限時間の期限計算の起点として、現在時刻を取得する。
+	if (gettimeofday(&deadline, NULL) < 0)
+	{
+		// 時刻取得に失敗した原因をログに記録する。
+		log_printf(LV_ERROR, "gettimeofday error.(errno = %d)\n", errno);
+		// 正しい期限を作れないため、エラーとして処理を中断する。
+		throw ERR_CLIENT_SYSTEM;
+	}
+	// 現在時刻に設定秒数を加えて、処理全体の絶対期限を作る。
+	deadline.tv_sec += timeout;
+
+	// 計算した期限を呼び出し元へ返す。
+	return deadline;
+}
+
+// 目的: select通過後にrecv/sendが停止しても、設定した期限内に処理を戻す。
+// 処理: 絶対期限から現在時刻を引いた残り時間を、対象ソケットの受信または送信タイムアウトに設定する。
+static void tcpSetSocketTimeout(int sd, int option, const struct timeval &deadline)
+{
+	// setsockoptへ渡す、ソケット操作の残り待ち時間を格納する。
+	struct timeval timeout;
+	// 残り時間を計算するための現在時刻を格納する。
+	struct timeval now;
+
+	// 特別値-1なら、ソケットの待ち時間制限を無効にする。
+	if (deadline.tv_sec == -1)
+	{
+		// timevalの0はSO_RCVTIMEO/SO_SNDTIMEOで無制限待ちを意味する。
+		timeout.tv_sec = 0;
+		// マイクロ秒部分も0にして無制限待ちを指定する。
+		timeout.tv_usec = 0;
+	}
+	else
+	{
+		// 有限期限までの残り時間を求めるため、現在時刻を取得する。
+		if (gettimeofday(&now, NULL) < 0)
+		{
+			// 時刻取得に失敗した原因をログに記録する。
+			log_printf(LV_ERROR, "gettimeofday error.(errno = %d)\n", errno);
+			// 残り時間を計算できないため、システムエラーとして中断する。
+			throw ERR_CLIENT_SYSTEM;
+		}
+		// 期限と現在時刻の秒差を残り時間の秒部分へ設定する。
+		timeout.tv_sec = deadline.tv_sec - now.tv_sec;
+		// 期限と現在時刻のマイクロ秒差を残り時間の小数部分へ設定する。
+		timeout.tv_usec = deadline.tv_usec - now.tv_usec;
+		// マイクロ秒差が負なら、秒から1秒を借りて正規化する。
+		if (timeout.tv_usec < 0)
+		{
+			// 借りた1秒分を秒の残り時間から差し引く。
+			timeout.tv_sec--;
+			// 借りた1秒をマイクロ秒へ換算して小数部分へ加える。
+			timeout.tv_usec += 1000000;
+		}
+		// 期限超過または残り時間ゼロなら、待ちに入る前にタイムアウトを返す。
+		if ((timeout.tv_sec < 0) || ((timeout.tv_sec == 0) && (timeout.tv_usec == 0)))
+		{
+			// 期限超過をログに記録する。
+			log_printf(LV_ERROR, "socket timeout.\n");
+			// 既存のselectタイムアウトと同じエラーコードで通知する。
+			throw ERR_CLIENT_SELECT_TIMEOUT;
+		}
+	}
+
+	// 指定された受信/送信オプションへ、計算した残り待ち時間を設定する。
+	if (setsockopt(sd, SOL_SOCKET, option, &timeout, sizeof(timeout)) < 0)
+	{
+		// ソケットオプション設定失敗の内容をログに記録する。
+		log_printf(LV_ERROR, "setsockopt timeout error.(option = %d, errno = %d)\n", option, errno);
+		// タイムアウトを設定できなかったため、システムエラーとして中断する。
+		throw ERR_CLIENT_SYSTEM;
+	}
+}
+
+/**
+ * @brief        コンストラクタ
+ */
+Client::Client(void)
+{
+	client_.local.addr_len = sizeof(client_.local.addr);
+	client_.remote.addr_len = sizeof(client_.remote.addr);
+}
+
+Client::Client(in_addr hostInfo, int portInfo)
+{
+	client_.remote.addr.sin_family = AF_INET;
+	client_.remote.addr.sin_port = portInfo;
+	client_.remote.addr.sin_addr = hostInfo;
+	client_.local.addr_len = sizeof(client_.local.addr);
+	client_.remote.addr_len = sizeof(client_.remote.addr);
+}
+
+/**
+ * @brief        デストラクタ
+ */
+Client::~Client()
+{
+}
+
+/**
+ * @brief        初期化処理
+ * @param[in]    host        ホスト名
+ * @param[in]    service     サービス名
+ * @param[out]   hostInfo    IPアドレス情報
+ * @param[out]   portInfo    ポート番号情報
+ *
+ * @retval       なし
+ */
+void Client::TcpInit(const char *host, const char *service, in_addr *hostInfo, int *portInfo)
+{
+	log_printf(LV_DEBUG, "start\n");
+
+	try
+	{
+		// ホスト名からIPアドレスを取得
+		if (hostInfo->s_addr == 0)
+		{
+			tcpGetHostByName(host, hostInfo);
+			log_printf(LV_DEBUG, "hostname = %s, hostInfo = %d\n", host, hostInfo->s_addr);
+		}
+
+		// サービス名からポート番号を取得
+		if (*portInfo == 0)
+		{
+			tcpGetServiceByName(service, portInfo);
+			log_printf(LV_DEBUG, "service = %s, portInfo = %d\n", service, *portInfo);
+		}
+
+		client_.remote.addr.sin_family = AF_INET;
+		client_.remote.addr.sin_port = *portInfo;
+		client_.remote.addr.sin_addr.s_addr = hostInfo->s_addr;
+
+		log_printf(LV_DEBUG, "hostInfo = %d\n", client_.remote.addr.sin_addr.s_addr);
+		log_printf(LV_DEBUG, "portInfo = %d\n", client_.remote.addr.sin_port);
+		log_printf(LV_DEBUG, "len      = %d\n", client_.remote.addr_len);
+	}
+	catch (int error)
+	{
+		log_printf(LV_ERROR, "error.(0x%x)\n", error);
+		throw error;
+	}
+	catch (...)
+	{
+		log_printf(LV_ERROR, "error.\n");
+		throw -1;
+	}
+
+	log_printf(LV_DEBUG, "end\n");
+
+	return;
+}
+
+/**
+ * @brief        サーバ接続
+ * @param[inout] sd          ソケットディスクリプタ
+ * @param[in]    connect     接続タイプ(0:常時接続型/1:毎回接続型)
+ *
+ * @retval       なし
+ */
+void Client::TcpConnect(int *sd, int connect)
+{
+	int err = 0;   ///< エラー戻り値
+	int sd_ = *sd; ///< ソケットディスクリプタ
+
+	log_printf(LV_DEBUG, "start\n");
+
+	// 常時接続型は初回時のみソケットを生成する
+	if ((connect == TCP_CONNECT) && (sd_ >= 0))
+	{
+		log_printf(LV_DEBUG, "sd(client:after socket) = %d\n", sd_);
+		log_printf(LV_DEBUG, "end(no exec.)\n");
+		return;
+	}
+
+	try
+	{
+		// ソケットを生成
+		sd_ = socket(AF_INET, SOCK_STREAM, 0);
+		if (sd_ < 0)
+		{
+			log_printf(LV_ERROR, "socket error.(sd = %d, errno = %d)\n", sd_, errno);
+			throw ERR_CLIENT_SYSTEM;
+		}
+		log_printf(LV_DEBUG, "sd(client:after socket) = %d\n", sd_);
+
+		// TIME_WAIT状態を回避する
+		struct linger optval;
+		optval.l_onoff = 1;
+		optval.l_linger = 0;
+		err = setsockopt(sd_, SOL_SOCKET, SO_LINGER, (void *)&optval, sizeof(optval));
+		if (err < 0)
+		{
+			throw ERR_CLIENT_SYSTEM;
+		}
+
+		//SST000-01635:Set tcp_nodelay for changing Nagle mode OFF(for avoid 40msec tcp delay) 
+		tcpConnect(sd_);
+
+		// サーバ接続
+		err = getsockname(sd_, (struct sockaddr *)&client_.local.addr, (SOCKLEN *)&client_.local.addr_len);
+		if (err < 0)
+		{
+			log_printf(LV_ERROR, "getsockname error.(err = %d, errno = %d)\n", err, errno);
+			throw ERR_CLIENT_GETSOCKNAME;
+		}
+		log_printf(LV_DEBUG, "local.sin_port = %d\n", client_.local.addr.sin_port);
+		log_printf(LV_DEBUG, "local.sin_addr = %d\n", client_.local.addr.sin_addr.s_addr);
+
+		// ローカルアドレスを取得
+		*sd = sd_;
+	}
+	catch (int error)
+	{
+		log_printf(LV_ERROR, "error.(0x%x)\n", error);
+		// 目的: 接続途中の失敗で、新しく作成したソケットがリークするのを防ぐ。
+		// 理由: 接続完了前は新しいFDが*sdへ反映されないため、ローカル変数sd_を使って閉じる。
+		// 既存の有効なFDがある場合だけ、今回の接続処理で確保したソケットを後始末する。
+		if (sd_ >= 0)
+		{
+			// 接続途中で確保したソケットを閉じる。
+			err = close(sd_);
+			// closeに失敗した場合も、後続の例外処理を続けられるよう原因を記録する。
+			if (err < 0)
+			{
+				// 対象FDとOSエラー番号を記録し、クローズ失敗を見えるようにする。
+				log_printf(LV_ERROR, "close error.(sd = %d, errno = %d)\n", sd_, errno);
+			}
+			// 呼び出し元のFDが今回閉じたFDと同じ場合だけ、無効値に更新する。
+			if (*sd == sd_)
+			{
+				// 二重クローズや再利用済みFDへの誤操作を避けるため、FDを無効化する。
+				*sd = -1;
+			}
+		}
+		// 元の整数エラーを維持し、呼び出し元のエラー処理へ返す。
+		throw error;
+	}
+	catch (...)
+	{
+		// 例外の詳細が整数でない場合も記録して後始末する。
+		log_printf(LV_ERROR, "error.\n");
+		// 目的: 予期しない例外でも、接続途中に作成したソケットを残さない。
+		// 理由: 接続完了前は*sdが新しいFDを指さないため、ローカル変数sd_で管理する。
+		if (sd_ >= 0)
+		{
+			// 接続途中で確保したソケットを閉じる。
+			err = close(sd_);
+			// closeに失敗した場合は、対象FDと原因をログへ残す。
+			if (err < 0)
+			{
+				// クローズ失敗を記録し、例外の再送出は継続する。
+				log_printf(LV_ERROR, "close error.(sd = %d, errno = %d)\n", sd_, errno);
+			}
+			// 呼び出し元のFDが閉じたFDと一致する場合は無効値にする。
+			if (*sd == sd_)
+			{
+				// 後続処理が同じFDを再利用しないよう、-1を設定する。
+				*sd = -1;
+			}
+		}
+		// 非整数例外を既存の汎用エラー値へ変換して呼び出し元へ返す。
+		throw -1;
+	}
+
+	log_printf(LV_DEBUG, "end\n");
+
+	return;
+}
+
+/**
+ * @brief        サーバからのデータ読み込み
+ *               読み込みは1メッセージ
+ * @param[in]    sd          ソケットディスクリプタ
+ * @param[out]   size        返信データサイズ
+ * @param[out]   data        返信データ
+ * @param[out]   error       エラー情報
+ * @param[out]   header      ヘッダ(固定文字列)
+ * @param[out]   funcId      関数ID
+ * @param[out]   parity1     パリティ情報1
+ * @param[out]   parity2     パリティ情報2
+ *
+ * @retval       なし
+ */
+void Client::TcpRead(int sd, int *size, char **data, int *error, char *header, int *funcId, int *parity1, int *parity2)
+{
+	log_printf(LV_DEBUG, "start\n");
+
+	// 中間メッセージ、返信メッセージ共にヘッダは8バイトである。
+	// 最初に8バイトデータを読み込みヘッダ情報を取得する。
+	int headRecvSize = HEADER_SIZE;
+	char headData[HEADER_SIZE + 1];
+	// 目的: ヘッダだけでなく本文・フッタの受信完了まで時間制限する。
+	// 処理: このTcpRead内のすべてのrecvが共有する絶対期限を、受信開始時に一度だけ作る。
+	struct timeval deadline = tcpCreateDeadline(RECEIVE_TIMEOUT);
+	memset(headData, 0, sizeof(headData));
+	// 最初のヘッダ受信について、従来どおり読み込み可能になるまで待つ。
+	tcpSelectRfs(sd, RECEIVE_TIMEOUT);
+	// ヘッダを受信し、以降の受信にも共通の絶対期限を渡す。
+	tcpReadBytes(sd, headRecvSize, headData, deadline);
+
+	if (strncmp(headData, "InfmHead", sizeof(headData)) == 0)
+	{
+
+		// 中間メッセージを受信した場合、残りのデータを読み込む
+		// 関数ID(4)＋パリティ情報(8)＋エラー情報(4)＋中間フッタ(8)
+		S_TcpMsgC msgC;
+		memset(&msgC, 0, sizeof(msgC));
+		int restRecvSize = sizeof(msgC) - sizeof(msgC.header);
+		char *restData = new char[restRecvSize];
+		if (restData == NULL)
+		{
+			throw ERR_CLIENT_MALLOC;
+		}
+		memset(restData, 0, restRecvSize * sizeof(char));
+		tcpReadBytes(sd, restRecvSize, restData, deadline);
+		memcpy(&msgC.header, headData, headRecvSize);
+		memcpy(&msgC.funcId, restData, restRecvSize);
+		if (restData != NULL)
+		{
+			delete[] restData;
+			restData = NULL;
+		}
+		memcpy(header, headData, headRecvSize);
+		*funcId = ntohl(msgC.funcId);
+		*parity1 = ntohl(msgC.parity1);
+		*parity2 = ntohl(msgC.parity2);
+		*error = ntohl(msgC.error);
+	}
+	else if (strncmp(headData, "RecvHead", sizeof(headData)) == 0)
+	{
+
+		// 返信メッセージを受信した場合
+		// 関数ID(4)＋パリティ情報(8)＋データサイズ(4)＋エラー情報(4)＋返信データ(可変)＋返信フッタ(8)
+		// 1. エラー情報(4)までのデータを読み込む
+		S_TcpMsgE msgE;
+		memset(&msgE, 0, sizeof(msgE));
+		int fixRecvSize = sizeof(msgE.funcId) + sizeof(msgE.parity1) + sizeof(msgE.parity2) + sizeof(msgE.size) + sizeof(msgE.error);
+		char *fixData = new char[fixRecvSize];
+		if (fixData == NULL)
+		{
+			throw ERR_CLIENT_MALLOC;
+		}
+		memset(fixData, 0, fixRecvSize * sizeof(char));
+		tcpReadBytes(sd, fixRecvSize, fixData, deadline);
+		memcpy(&msgE.header, headData, headRecvSize);
+		memcpy(&msgE.funcId, fixData, fixRecvSize);
+		if (fixData != NULL)
+		{
+			delete[] fixData;
+			fixData = NULL;
+		}
+
+		// 2. 取得したデータサイズの情報を元に残りのデータを読み込む
+		msgE.size = ntohl(msgE.size);
+		if (msgE.size <= 0)
+		{
+			log_printf(LV_DEBUG, "parameter size is illegal.(%d)\n", msgE.size);
+			throw ERR_CLIENT_RECEIVE;
+		}
+		*size = msgE.size;
+		int restRecvSize = *size + sizeof(msgE.footer);
+		if (*data != NULL)
+		{
+			delete[] *data;
+			*data = NULL;
+		}
+		*data = new char[*size];
+		char *restData = new char[restRecvSize];
+		if ((*data == NULL) || (restData == NULL))
+		{
+			throw ERR_CLIENT_MALLOC;
+		}
+		memset(*data, 0, *size * sizeof(char));
+		memset(restData, 0, restRecvSize * sizeof(char));
+		tcpReadBytes(sd, restRecvSize, restData, deadline);
+		memcpy(*data, &restData[0], *size);
+		memcpy(&msgE.footer, &restData[*size], sizeof(msgE.footer));
+		if (restData != NULL)
+		{
+			// dataの領域解放は通常上位で行う
+			delete[] restData;
+			restData = NULL;
+		}
+		memcpy(header, headData, headRecvSize);
+		*funcId = ntohl(msgE.funcId);
+		*parity1 = ntohl(msgE.parity1);
+		*parity2 = ntohl(msgE.parity2);
+		*error = ntohl(msgE.error);
+	}
+	else
+	{
+		// ヘッダが見つからない
+		log_printf(LV_ERROR, "not find header error.(%s)\n", headData);
+		throw ERR_CLIENT_RECEIVE;
+	}
+
+	log_printf(LV_DEBUG, "header  = %s\n", header);
+	log_printf(LV_DEBUG, "funcId  = %d\n", *funcId);
+	log_printf(LV_DEBUG, "parity1 = %d\n", *parity1);
+	log_printf(LV_DEBUG, "parity2 = %d\n", *parity2);
+	log_printf(LV_DEBUG, "error   = %d\n", *error);
+
+	log_printf(LV_DEBUG, "end\n");
+
+	return;
+}
+
+/**
+ * @brief        サーバにデータ書き込み
+ * @param[in]    sd          ソケットディスクリプタ
+ * @param[in]    size        送信データサイズ
+ * @param[in]    data        送信データ
+ *
+ * @retval       なし
+ */
+void Client::TcpWrite(int sd, int size, char *data)
+{
+	log_printf(LV_DEBUG, "start\n");
+
+	// サーバにデータ書き込み
+	// 目的: 送信が部分送信に分かれても、TcpWrite全体の待ち時間に上限を設ける。
+	// 処理: select待ちと後続の全sendで共有する絶対期限を、送信開始時に一度だけ作る。
+	struct timeval deadline = tcpCreateDeadline(SEND_TIMEOUT);
+	// 最初の送信前に、ソケットが書き込み可能になるまで設定時間だけ待つ。
+	tcpSelectWfs(sd, SEND_TIMEOUT);
+	// 残りの全データを送信し、各sendにも同じ絶対期限を適用する。
+	tcpWriteBytes(sd, size, data, deadline);
+
+	log_printf(LV_DEBUG, "end\n");
+
+	return;
+}
+
+/**
+ * @brief        サーバ切断
+ * @param[inout] sd          ソケットディスクリプタ
+ * @param[in]    connect     接続タイプ(0:常時接続型/1:毎回接続型)
+ *
+ * @retval       なし
+ */
+void Client::TcpClose(int *sd, int connect)
+{
+	int err = 0;   ///< エラー戻り値
+	int sd_ = *sd; ///< ソケットディスクリプタ
+
+	log_printf(LV_DEBUG, "start\n");
+
+	// 常時接続型は切断しない
+	if (connect == TCP_CONNECT)
+	{
+		log_printf(LV_DEBUG, "end(no exec.)\n");
+		return;
+	}
+
+	// 書き込みを閉じ、相手にFINを送る
+	// 相手からのFINを待たずに強制終了する
+	err = shutdown(sd_, SHUT_RDWR);
+	if (err < 0)
+	{
+		log_printf(LV_ERROR, "shutdown error.(err = %d, errno = %d)\n", err, errno);
+	}
+
+	// ソケットを閉じる
+	err = close(sd_);
+	if (err < 0)
+	{
+		log_printf(LV_ERROR, "close error.(err = %d, errno = %d)\n", err, errno);
+	}
+	log_printf(LV_DEBUG, "sd(client:after close) = %d\n", *sd);
+	*sd = -1;
+
+	log_printf(LV_DEBUG, "end\n");
+
+	return;
+}
+
+/**
+ * @brief        ホスト名からIPアドレスを取得
+ * @param[in]    host        ホスト名
+ * @param[out]   in_addr     IPアドレス(struct in_addr)
+ *
+ * @retval       なし
+ */
+void Client::tcpGetHostByName(const char *host, struct in_addr *in_addr)
+{
+	struct hostent *h_info; ///< hostent構造体
+
+	// ホスト名からIPアドレスを取得
+	h_info = gethostbyname(host);
+	if (h_info == NULL)
+	{
+		log_printf(LV_ERROR, "gethostbyname error.(%d)\n", errno);
+		throw ERR_CLIENT_GETHOSTBYNAME;
+	}
+	memcpy(&in_addr->s_addr, h_info->h_addr_list[0], h_info->h_length);
+	log_printf(LV_DEBUG, "h_length = %d\n", h_info->h_length);
+	log_printf(LV_DEBUG, "s_addr = %d\n", (int)in_addr->s_addr);
+
+	return;
+}
+
+/**
+ * @brief        サービス名からポート番号を取得
+ * @param[in]    service     サービス名
+ * @param[out]   port        ポート番号
+ *
+ * @retval       なし
+ */
+void Client::tcpGetServiceByName(const char *service, int *port)
+{
+	struct servent *se = NULL; ///< servent構造体
+
+	// サービス名からポート番号を取得
+	// プロトコルはTCP固定
+	se = getservbyname(service, "tcp");
+	if (se == NULL)
+	{
+		log_printf(LV_ERROR, "getservbyname error.(%d)\n", errno);
+		throw ERR_CLIENT_GETSERVBYNAME;
+	}
+	*port = se->s_port;
+	log_printf(LV_DEBUG, "service: %s, port:%d\n", service, *port);
+
+	return;
+}
+
+/**
+ * @brief        connect実行
+ * @param[in]    sd          ソケットディスクリプタ
+ *
+ * @retval       なし
+ */
+void Client::tcpConnect(int sd)
+{
+	int err = 0;		   ///< エラー戻り値
+	int connect_errno = 0; ///< 接続時のエラー情報
+
+	log_printf(LV_DEBUG, "start\n");
+
+	try
+	{
+		// ノンブロッキングモードに変更
+		tcpSetNonBlockingMode(sd);
+
+		// サーバ接続
+		err = connect(sd, (struct sockaddr *)&(client_.remote.addr), client_.remote.addr_len);
+		connect_errno = errno;
+		if (err == 0)
+		{
+			// サーバとクライアントが同一ホストの場合はこのタイミングでコネクションが確立するはず
+			// ブロッキングモードに戻す
+			tcpSetBlockingMode(sd);
+			log_printf(LV_DEBUG, "end\n");
+			return;
+		}
+		if (connect_errno != EINPROGRESS)
+		{
+			// サーバとクライアントが別ホストの場合は、コネクション確立を開始していればEINPROGRESSが返ってくるはず
+			log_printf(LV_ERROR, "connect error = %d\n", connect_errno);
+			throw ERR_CLIENT_CONNECT;
+		}
+
+		// select実行
+		tcpSelect(sd, CONNECT_TIMEOUT);
+
+		// ブロッキングモードに戻す
+		tcpSetBlockingMode(sd);
+	}
+	catch (int error)
+	{
+		// sdが取れた場合のみブロッキングモードに戻す
+		if (error != ERR_CLIENT_19)
+		{
+			tcpSetBlockingMode(sd);
+		}
+		log_printf(LV_ERROR, "error.(0x%x)\n", error);
+		throw error;
+	}
+	catch (...)
+	{
+		tcpSetBlockingMode(sd);
+		log_printf(LV_ERROR, "error.\n");
+		throw -1;
+	}
+
+	log_printf(LV_DEBUG, "end\n");
+
+	return;
+}
+
+/**
+ * @brief        select実行(読み込み可能待ち)
+ * @param[in]    sd          ソケットディスクリプタ
+ * @param[in]    timeout     タイムアウト時間 [sec]
+ *
+ * @retval       なし
+ */
+void Client::tcpSelectRfs(int sd, int timeout)
+{
+	int err = 0;	   ///< エラー戻り値
+	fd_set rfs;		   ///< ファイルディスクリプタ
+	struct timeval tv; ///< タイムアウト時間設定
+
+	log_printf(LV_DEBUG, "start\n");
+
+	try
+	{
+		FD_ZERO(&rfs);
+		FD_SET(sd, &rfs);
+
+		// セレクトのタイムアウト時間を設定
+		tv.tv_sec = timeout;
+		tv.tv_usec = 0;
+
+		// select()実行
+		if (timeout == -1)
+		{
+			err = select(sd + 1, &rfs, NULL, NULL, NULL); // タイムアウトなし
+		}
+		else
+		{
+			err = select(sd + 1, &rfs, NULL, NULL, &tv);
+		}
+		if (err == 0)
+		{
+			// タイムアウト
+			log_printf(LV_DEBUG, "select timeout.(%d)\n", (int)tv.tv_sec);
+			throw ERR_CLIENT_SELECT_TIMEOUT;
+		}
+		else if (err < 0)
+		{
+			log_printf(LV_ERROR, "select error.(err = %d, errno = %d)\n", err, errno);
+			throw ERR_CLIENT_SELECT;
+		}
+
+		// ファイルディスクリプタにデータあり
+		if (FD_ISSET(sd, &rfs))
+		{
+			int error_code;
+			int len = sizeof(error_code);
+			;
+
+			// ソケット中の保留のエラーを取得
+			err = getsockopt(sd, SOL_SOCKET, SO_ERROR, &error_code, (SOCKLEN *)&len);
+			if (err < 0)
+			{
+				log_printf(LV_ERROR, "getsockopt error.(err = %d, errno = %d)\n", err, errno);
+				throw ERR_CLIENT_GETSOCKOPT;
+			}
+
+			// 念のためエラーチェック
+			if (error_code != 0)
+			{
+				log_printf(LV_ERROR, "getsockopt error.(%d)\n", error_code);
+				throw ERR_CLIENT_GETSOCKOPT_2;
+			}
+		}
+		else
+		{
+			log_printf(LV_DEBUG, "socket not set.\n");
+			throw ERR_CLIENT_SELECT_NO_SOCKET;
+		}
+	}
+	catch (int error)
+	{
+		log_printf(LV_ERROR, "error.(0x%x)\n", error);
+		throw error;
+	}
+	catch (...)
+	{
+		log_printf(LV_ERROR, "error.\n");
+		throw -1;
+	}
+
+	log_printf(LV_DEBUG, "end\n");
+
+	return;
+}
+
+/**
+ * @brief        select実行(書き込み可能待ち)
+ * @param[in]    sd          ソケットディスクリプタ
+ * @param[in]    timeout     タイムアウト時間 [sec]
+ *
+ * @retval       なし
+ */
+void Client::tcpSelectWfs(int sd, int timeout)
+{
+	int err = 0;	   ///< エラー戻り値
+	fd_set wfs;		   ///< ファイルディスクリプタ
+	struct timeval tv; ///< タイムアウト時間設定
+
+	log_printf(LV_DEBUG, "start\n");
+
+	try
+	{
+		FD_ZERO(&wfs);
+		FD_SET(sd, &wfs);
+
+		// セレクトのタイムアウト時間を設定
+		tv.tv_sec = timeout;
+		tv.tv_usec = 0;
+
+		// select()実行
+		if (timeout == -1)
+		{
+			err = select(sd + 1, NULL, &wfs, NULL, NULL); // タイムアウトなし
+		}
+		else
+		{
+			err = select(sd + 1, NULL, &wfs, NULL, &tv);
+		}
+		if (err == 0)
+		{
+			// タイムアウト
+			log_printf(LV_DEBUG, "select timeout.(%d)\n", (int)tv.tv_sec);
+			throw ERR_CLIENT_SELECT_TIMEOUT;
+		}
+		else if (err < 0)
+		{
+			log_printf(LV_ERROR, "select error.(err = %d, errno = %d)\n", err, errno);
+			throw ERR_CLIENT_SELECT;
+		}
+
+		// ファイルディスクリプタにデータあり
+		if (FD_ISSET(sd, &wfs))
+		{
+			int error_code;
+			int len = sizeof(error_code);
+			;
+
+			// ソケット中の保留のエラーを取得
+			err = getsockopt(sd, SOL_SOCKET, SO_ERROR, &error_code, (SOCKLEN *)&len);
+			if (err < 0)
+			{
+				log_printf(LV_ERROR, "getsockopt error.(err = %d, errno = %d)\n", err, errno);
+				throw ERR_CLIENT_GETSOCKOPT;
+			}
+
+			// 念のためエラーチェック
+			if (error_code != 0)
+			{
+				log_printf(LV_ERROR, "getsockopt error.(%d)\n", error_code);
+				throw ERR_CLIENT_GETSOCKOPT_2;
+			}
+		}
+		else
+		{
+			log_printf(LV_DEBUG, "socket not set.\n");
+			throw ERR_CLIENT_SELECT_NO_SOCKET;
+		}
+	}
+	catch (int error)
+	{
+		log_printf(LV_ERROR, "error.(0x%x)\n", error);
+		throw error;
+	}
+	catch (...)
+	{
+		log_printf(LV_ERROR, "error.\n");
+		throw -1;
+	}
+
+	log_printf(LV_DEBUG, "end\n");
+
+	return;
+}
+
+/**
+ * @brief        select実行(読み書き可能待ち)
+ * @param[in]    sd          ソケットディスクリプタ
+ * @param[in]    timeout     タイムアウト時間 [sec]
+ *
+ * @retval       なし
+ */
+void Client::tcpSelect(int sd, int timeout)
+{
+	int err = 0;	   ///< エラー戻り値
+	fd_set rfs, wfs;   ///< ファイルディスクリプタ
+	struct timeval tv; ///< タイムアウト時間設定
+
+	log_printf(LV_DEBUG, "start\n");
+
+	try
+	{
+		// 読み書き両方をセレクトで待つ設定
+		FD_ZERO(&rfs);
+		FD_SET(sd, &rfs);
+		FD_ZERO(&wfs);
+		FD_SET(sd, &wfs);
+
+		// セレクトのタイムアウト時間を設定
+		tv.tv_sec = timeout;
+		tv.tv_usec = 0;
+
+		// select()実行
+		if (timeout == -1)
+		{
+			err = select(sd + 1, &rfs, &wfs, NULL, NULL); // タイムアウトなし
+		}
+		else
+		{
+			err = select(sd + 1, &rfs, &wfs, NULL, &tv);
+		}
+		if (err == 0)
+		{
+			// タイムアウト
+			log_printf(LV_DEBUG, "select timeout.(%d)\n", (int)tv.tv_sec);
+			throw ERR_CLIENT_SELECT_TIMEOUT;
+		}
+		else if (err < 0)
+		{
+			log_printf(LV_ERROR, "select error.(err = %d, errno = %d)\n", err, errno);
+			throw ERR_CLIENT_SELECT;
+		}
+
+		// 読み書きができれば接続完了
+		if (FD_ISSET(sd, &rfs) || FD_ISSET(sd, &wfs))
+		{
+			int error_code;
+			int len = sizeof(error_code);
+			;
+
+			// ソケット中の保留のエラーを取得
+			err = getsockopt(sd, SOL_SOCKET, SO_ERROR, &error_code, (SOCKLEN *)&len);
+			if (err < 0)
+			{
+				log_printf(LV_ERROR, "getsockopt error.(err = %d, errno = %d)\n", err, errno);
+				throw ERR_CLIENT_GETSOCKOPT;
+			}
+
+			// 念のためエラーチェック
+			if (error_code != 0)
+			{
+				log_printf(LV_ERROR, "getsockopt error.(%d)\n", error_code);
+				throw ERR_CLIENT_GETSOCKOPT_2;
+			}
+		}
+		else
+		{
+			log_printf(LV_DEBUG, "socket not set.\n");
+			throw ERR_CLIENT_SELECT_NO_SOCKET;
+		}
+	}
+	catch (int error)
+	{
+		log_printf(LV_ERROR, "error.(0x%x)\n", error);
+		throw error;
+	}
+	catch (...)
+	{
+		log_printf(LV_ERROR, "error.\n");
+		throw -1;
+	}
+
+	log_printf(LV_DEBUG, "end\n");
+
+	return;
+}
+
+/**
+ * @brief        ノンブロッキングモードに変更
+ * @param[in]    sd          ソケットディスクリプタ
+ *
+ * @retval       なし
+ */
+void Client::tcpSetNonBlockingMode(int sd)
+{
+	int flags; ///< fcntl戻り値
+
+	flags = fcntl(sd, F_GETFL, 0);
+	if (flags < 0)
+	{
+		log_printf(LV_ERROR, "fcntl error.(err = %d, errno = %d)\n", flags, errno);
+		throw ERR_CLIENT_FCNTL;
+	}
+
+	if (fcntl(sd, F_SETFL, flags | O_NONBLOCK))
+	{
+		log_printf(LV_ERROR, "fcntl error.(errno = %d)\n", errno);
+		throw ERR_CLIENT_FCNTL;
+	}
+
+	return;
+}
+
+/**
+ * @brief        ブロッキングモードに変更
+ * @param[in]    sd          ソケットディスクリプタ
+ *
+ * @retval       なし
+ */
+void Client::tcpSetBlockingMode(int sd)
+{
+	int flags; ///< fcntl戻り値
+
+	flags = fcntl(sd, F_GETFL, 0);
+	if (flags < 0)
+	{
+		log_printf(LV_ERROR, "fcntl error.(err = %d, errno = %d)\n", flags, errno);
+		throw ERR_CLIENT_FCNTL;
+	}
+
+	if (fcntl(sd, F_SETFL, flags & ~O_NONBLOCK))
+	{
+		log_printf(LV_ERROR, "fcntl error.(errno = %d)\n", errno);
+		throw ERR_CLIENT_FCNTL;
+	}
+
+	return;
+}
+
+/**
+ * @brief        指定したバイトだけデータを受信
+ * @param[in]    sd          ソケットディスクリプタ
+ * @param[in]    size        データサイズ
+ * @param[out]   data        受信データ
+ *
+ * @retval       なし
+ */
+void Client::tcpReadBytes(int sd, int size, char *data, const struct timeval &deadline)
+{
+	int restSize = 0; ///< 残受信データサイズ
+	int nRecv = 0;	  ///< データ受信結果
+
+	log_printf(LV_DEBUG, "start\n");
+
+	// 指定サイズ受信できるまで繰り返し受信を行う
+	restSize = size;
+	while (restSize > 0)
+	{
+
+		log_printf(LV_DEBUG, "recv size(%d)\n", restSize);
+		// このrecvが期限を越えてブロックしないよう、受信直前に残り時間を設定する。
+		tcpSetSocketTimeout(sd, SO_RCVTIMEO, deadline);
+		// ソケットから未受信分を読み込み、実際に受け取ったバイト数を得る。
+		nRecv = recv(sd, data, restSize, 0);
+		// recvがエラーを返した場合は、タイムアウトか通常の受信エラーかを判定する。
+		if (nRecv < 0)
+		{
+			// ソケット受信タイムアウトを示すエラー番号か確認する。
+			if ((errno == EAGAIN) || (errno == EWOULDBLOCK))
+			{
+				// 受信タイムアウトをログに記録し、既存のタイムアウトエラーとして通知する。
+				log_printf(LV_ERROR, "recv timeout.\n");
+				// 呼び出し元の共通タイムアウト処理へ制御を移す。
+				throw ERR_CLIENT_SELECT_TIMEOUT;
+			}
+			// 受信エラー
+			log_printf(LV_ERROR, "recv error.(err = %d, errno = %d)\n", nRecv, errno);
+			throw ERR_CLIENT_RECV;
+		}
+		else if (nRecv == 0)
+		{
+			// 回線切断
+			log_printf(LV_ERROR, "connection closed error.\n");
+			throw ERR_CLIENT_RECV_DISCONNECT;
+		}
+		data += nRecv;
+		restSize -= nRecv;
+	}
+
+	log_printf(LV_DEBUG, "end\n");
+
+	return;
+}
+
+/**
+ * @brief        指定したバイトだけデータを送信
+ * @param[in]    sd          ソケットディスクリプタ
+ * @param[in]    size        データサイズ
+ * @param[in]    data        送信データ
+ *
+ * @retval       なし
+ */
+void Client::tcpWriteBytes(int sd, int size, char *data, const struct timeval &deadline)
+{
+	int restSize = 0; ///< 残送信データサイズ
+	int nSend = 0;	  ///< データ送信結果
+
+	log_printf(LV_DEBUG, "start\n");
+
+	restSize = size;
+	while (restSize > 0)
+	{
+
+		// SIGPIPEの発生を抑止
+		log_printf(LV_DEBUG, "send size(%d)\n", restSize);
+		// このsendが期限を越えてブロックしないよう、送信直前に残り時間を設定する。
+		tcpSetSocketTimeout(sd, SO_SNDTIMEO, deadline);
+		// 未送信分をソケットへ書き込み、実際に送れたバイト数を得る。
+		nSend = send(sd, data, restSize, 0);
+		// sendがエラーを返した場合は、タイムアウトか通常の送信エラーかを判定する。
+		if (nSend < 0)
+		{
+			// ソケット送信タイムアウトを示すエラー番号か確認する。
+			if ((errno == EAGAIN) || (errno == EWOULDBLOCK))
+			{
+				// 送信タイムアウトをログに記録し、既存のタイムアウトエラーとして通知する。
+				log_printf(LV_ERROR, "send timeout.\n");
+				// 呼び出し元の共通タイムアウト処理へ制御を移す。
+				throw ERR_CLIENT_SELECT_TIMEOUT;
+			}
+			// 送信エラー
+			log_printf(LV_ERROR, "send error.(err = %d, errno = %d)\n", nSend, errno);
+			throw ERR_CLIENT_SEND;
+		}
+		else if (nSend == 0)
+		{
+			// 回線切断
+			log_printf(LV_ERROR, "connection closed error.\n");
+			throw ERR_CLIENT_SEND_DISCONNECT;
+		}
+		data += nSend;
+		restSize -= nSend;
+	}
+
+	log_printf(LV_DEBUG, "end\n");
+
+	return;
+}
+
+
+----------------------------------------------------------------------------------------------------
+Client.hpp
+----------------------------------------------------------------------------------------------------
+/**
+ * @file    Client.hpp
+ * @author  Copyright(C) Canon Inc. All right reserved.
+ * @date    2014/01/10
+ * @brief   クライアントクラス
+ * @par     説明
+ *  - TCP通信のクライアント機能を実現するクラス
+ */
+#ifndef __Client_h__
+#define __Client_h__
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+#include <netdb.h>
+#ifdef __cplusplus
+}
+#endif
+
+#include <stdio.h>
+#include <sys/types.h>
+#include <sys/socket.h>
+#include <string>
+#include <netinet/in.h>
+#include <arpa/inet.h>
+#include <fcntl.h>
+#include <errno.h>
+#ifdef LINUX
+#include <sys/time.h>
+#else
+#include <time.h>
+#endif
+
+/**
+ * @brief ChorusとLinuxの差分吸収
+ */
+#ifdef LINUX
+#define SOCKLEN socklen_t       ///< アドレスの長さを格納する型
+#else
+#define SOCKLEN int             ///< アドレスの長さを格納する型
+#endif
+
+/**
+ * @brief エラーstatus2
+ */
+static const int ERR_CLIENT_TIMEOUT  = 0x1;
+static const int ERR_CLIENT_RECEIVE  = 0x2;
+static const int ERR_CLIENT_SYSTEM   = 0x20;
+static const int ERR_CLIENT_MALLOC   = 0x30;
+static const int ERR_CLIENT_GETSOCKNAME   = 0x41;
+static const int ERR_CLIENT_GETHOSTBYNAME   = 0x42;
+static const int ERR_CLIENT_GETSERVBYNAME   = 0x43;
+static const int ERR_CLIENT_CONNECT   = 0x44;
+static const int ERR_CLIENT_SELECT_TIMEOUT   = 0x45;
+static const int ERR_CLIENT_SELECT   = 0x46;
+static const int ERR_CLIENT_GETSOCKOPT   = 0x47;
+static const int ERR_CLIENT_GETSOCKOPT_2   = 0x48;
+static const int ERR_CLIENT_SELECT_NO_SOCKET   = 0x49;
+static const int ERR_CLIENT_FCNTL  = 0x4a;
+static const int ERR_CLIENT_RECV  = 0x4b;
+static const int ERR_CLIENT_RECV_DISCONNECT  = 0x4c;
+static const int ERR_CLIENT_SEND  = 0x4d;
+static const int ERR_CLIENT_SEND_DISCONNECT  = 0x4e;
+static const int ERR_CLIENT_15  = 0x4f;
+static const int ERR_CLIENT_16  = 0x50;
+static const int ERR_CLIENT_17  = 0x51;
+static const int ERR_CLIENT_18  = 0x52;
+static const int ERR_CLIENT_19  = 0x53;
+static const int ERR_CLIENT_21  = 0x55;
+static const int ERR_CLIENT_22  = 0x56;
+static const int ERR_CLIENT_23  = 0x57;
+
+
+/**
+ * @brief ローカル定義
+ */
+const int CONNECT_TIMEOUT        = 30; ///< Connect timeout in seconds; -1 disables it.
+const int TIMEOUT        = 3000; ///< タイムアウト時間[sec]
+const int HEADER_SIZE    = 8;   ///< ヘッダサイズ(8バイト固定)
+
+#ifndef LINUX
+/**
+ * @brief shutdownモード
+ */
+typedef enum {
+    SHUT_RD = 0,               ///< Read
+    SHUT_WR,                   ///< Write
+    SHUT_RDWR,                 ///< Read & Write
+} E_ShutdownMode;
+#else
+#endif
+
+/**
+ * @brief TCP構造体
+ */
+typedef struct {
+    struct sockaddr_in addr;     ///< アドレス
+    size_t             addr_len; ///< アドレス長
+} S_TcpAddress;
+
+/**
+ * @brief TCPクライアント情報
+ */
+typedef struct {
+    S_TcpAddress local;          ///< ローカル(Client側)アドレス情報
+    S_TcpAddress remote;         ///< リモート(Server側)アドレス情報
+} S_TcpClient;
+
+/**
+ * @brief 送信メッセージ固定部フォーマット
+ */
+typedef struct {
+    char         header[8];      ///< 返信ヘッダ(固定文字列)
+    int          funcId;         ///< 関数ID
+    int          parity1;        ///< パリティ情報1
+    int          parity2;        ///< パリティ情報2
+    int          size;           ///< データサイズ
+    int          cMsg;           ///< 中間メッセージ有無情報(0:なし/1:あり)
+    char         footer[8];      ///< 返信フッタ(固定文字列)
+} S_TcpMsgS;
+
+/**
+ * @brief 中間メッセージ固定部フォーマット
+ */
+typedef struct {
+    char         header[8];      ///< 返信ヘッダ(固定文字列)
+    int          funcId;         ///< 関数ID
+    int          parity1;        ///< パリティ情報1
+    int          parity2;        ///< パリティ情報2
+    int          error;          ///< エラー情報
+    char         footer[8];      ///< 返信フッタ(固定文字列)
+} S_TcpMsgC;
+
+/**
+ * @brief 返信メッセージ固定部フォーマット
+ */
+typedef struct {
+    char         header[8];      ///< 返信ヘッダ(固定文字列)
+    int          funcId;         ///< 関数ID
+    int          parity1;        ///< パリティ情報1
+    int          parity2;        ///< パリティ情報2
+    int          size;           ///< データサイズ
+    int          error;          ///< エラー情報
+    char         footer[8];      ///< 返信フッタ(固定文字列)
+} S_TcpMsgE;
+
+class Client
+{
+public:
+    /**
+     * @brief        コンストラクタ
+     */
+    Client(void);
+    Client(in_addr hostInfo, int portInfo);
+
+    /**
+     * @brief        デストラクタ
+     */
+    ~Client();
+
+    /**
+     * @brief        初期化処理
+     * @param[in]    host        ホスト名
+     * @param[in]    service     サービス名
+     * @param[out]   hostInfo    IPアドレス情報
+     * @param[out]   portInfo    ポート番号情報
+     */
+    void TcpInit(const char *host, const char *service, in_addr *hostInfo, int *portInfo);
+
+    /**
+     * @brief        サーバ接続
+     * @param[inout] sd          ソケットディスクリプタ
+     * @param[in]    connect     接続タイプ(0:常時接続型/1:毎回接続型)
+     */
+    void TcpConnect(int *sd, int connect);
+
+    /**
+     * @brief        サーバからのデータ読み込み
+     *               読み込みは1メッセージ
+     * @param[in]    sd          ソケットディスクリプタ
+     * @param[out]   size        返信データサイズ
+     * @param[out]   data        返信データ
+     * @param[out]   error       エラー情報
+     * @param[out]   header      ヘッダ(固定文字列)
+     * @param[out]   funcId      関数ID
+     * @param[out]   parity1     パリティ情報1
+     * @param[out]   parity2     パリティ情報2
+     */
+    void TcpRead(int sd, int *size, char **data, int *error, char *header, int *funcId, int *parity1, int *parity2);
+
+    /**
+     * @brief        サーバにデータ書き込み
+     * @param[in]    sd          ソケットディスクリプタ
+     * @param[in]    size        送信データサイズ
+     * @param[in]    data        送信データ
+     */
+    void TcpWrite(int sd, int size, char *data);
+
+
+    /**
+     * @brief        サーバ切断
+     * @param[inout] sd          ソケットディスクリプタ
+     * @param[in]    connect     接続タイプ(0:常時接続型/1:毎回接続型)
+     */
+    void TcpClose(int *sd, int connect);
+
+private:
+    S_TcpClient client_;     ///< TCPクライアント情報
+
+    /**
+     * @brief        ホスト名からIPアドレスを取得
+     * @param[in]    host        ホスト名
+     * @param[out]   in_addr     IPアドレス(struct in_addr)
+     */
+    void tcpGetHostByName(const char *host, struct in_addr *in_addr);
+
+    /**
+     * @brief        サービス名からポート番号を取得
+     * @param[in]    service     サービス名
+     * @param[out]   port        ポート番号
+     */
+    void tcpGetServiceByName(const char *service, int *port);
+
+    /**
+     * @brief        connect実行
+     * @param[in]    sd          ソケットディスクリプタ
+     */
+    void tcpConnect(int sd);
+
+    /**
+     * @brief        select実行(読み込み可能待ち)
+     * @param[in]    sd          ソケットディスクリプタ
+     * @param[in]    timeout     タイムアウト時間 [sec]
+     */
+    void tcpSelectRfs(int sd, int timeout);
+
+    /**
+     * @brief        select実行(書き込み可能待ち)
+     * @param[in]    sd          ソケットディスクリプタ
+     * @param[in]    timeout     タイムアウト時間 [sec]
+     */
+    void tcpSelectWfs(int sd, int timeout);
+
+    /**
+     * @brief        select実行(読み書き可能待ち)
+     * @param[in]    sd          ソケットディスクリプタ
+     * @param[in]    timeout     タイムアウト時間 [sec]
+     */
+    void tcpSelect(int sd, int timeout);
+
+    /**
+     * @brief        ノンブロッキングモードに変更
+     * @param[in]    sd          ソケットディスクリプタ
+     */
+    void tcpSetNonBlockingMode(int sd);
+
+    /**
+     * @brief        ブロッキングモードに変更
+     * @param[in]    sd          ソケットディスクリプタ
+     */
+    void tcpSetBlockingMode(int sd);
+
+    /**
+     * @brief        指定したバイトだけデータを受信
+     * @param[in]    sd          ソケットディスクリプタ
+     * @param[in]    size        データサイズ
+     * @param[out]   data        受信データ
+     */
+    void tcpReadBytes(int sd, int size, char *data);
+
+    /**
+     * @brief        指定したバイトだけデータを送信
+     * @param[in]    sd          ソケットディスクリプタ
+     * @param[in]    size        データサイズ
+     * @param[in]    data        送信データ
+     */
+    void tcpWriteBytes(int sd, int size, char *data);
+};
+
+#endif // __Client_h__
+
+
+----------------------------------------------------------------------------------------------------
+/**
+ * @file    Client.hpp
+ * @author  Copyright(C) Canon Inc. All right reserved.
+ * @date    2014/01/10
+ * @brief   クライアントクラス
+ * @par     説明
+ *  - TCP通信のクライアント機能を実現するクラス
+ */
+#ifndef __Client_h__
+#define __Client_h__
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+#include <netdb.h>
+#ifdef __cplusplus
+}
+#endif
+
+#include <stdio.h>
+#include <sys/types.h>
+#include <sys/socket.h>
+#include <string>
+#include <netinet/in.h>
+#include <arpa/inet.h>
+#include <fcntl.h>
+#include <errno.h>
+#ifdef LINUX
+#include <sys/time.h>
+#else
+#include <time.h>
+#endif
+
+/**
+ * @brief ChorusとLinuxの差分吸収
+ */
+#ifdef LINUX
+#define SOCKLEN socklen_t       ///< アドレスの長さを格納する型
+#else
+#define SOCKLEN int             ///< アドレスの長さを格納する型
+#endif
+
+/**
+ * @brief エラーstatus2
+ */
+static const int ERR_CLIENT_TIMEOUT  = 0x1;
+static const int ERR_CLIENT_RECEIVE  = 0x2;
+static const int ERR_CLIENT_SYSTEM   = 0x20;
+static const int ERR_CLIENT_MALLOC   = 0x30;
+static const int ERR_CLIENT_GETSOCKNAME   = 0x41;
+static const int ERR_CLIENT_GETHOSTBYNAME   = 0x42;
+static const int ERR_CLIENT_GETSERVBYNAME   = 0x43;
+static const int ERR_CLIENT_CONNECT   = 0x44;
+static const int ERR_CLIENT_SELECT_TIMEOUT   = 0x45;
+static const int ERR_CLIENT_SELECT   = 0x46;
+static const int ERR_CLIENT_GETSOCKOPT   = 0x47;
+static const int ERR_CLIENT_GETSOCKOPT_2   = 0x48;
+static const int ERR_CLIENT_SELECT_NO_SOCKET   = 0x49;
+static const int ERR_CLIENT_FCNTL  = 0x4a;
+static const int ERR_CLIENT_RECV  = 0x4b;
+static const int ERR_CLIENT_RECV_DISCONNECT  = 0x4c;
+static const int ERR_CLIENT_SEND  = 0x4d;
+static const int ERR_CLIENT_SEND_DISCONNECT  = 0x4e;
+static const int ERR_CLIENT_15  = 0x4f;
+static const int ERR_CLIENT_16  = 0x50;
+static const int ERR_CLIENT_17  = 0x51;
+static const int ERR_CLIENT_18  = 0x52;
+static const int ERR_CLIENT_19  = 0x53;
+static const int ERR_CLIENT_21  = 0x55;
+static const int ERR_CLIENT_22  = 0x56;
+static const int ERR_CLIENT_23  = 0x57;
+
+
+/**
+ * @brief ローカル定義
+ */
+const int CONNECT_TIMEOUT        = 30;   ///< 接続待ちの上限時間[秒]。-1は無制限。
+const int RECEIVE_TIMEOUT        = 3000; ///< 1回のTcpRead全体の受信上限時間[秒]。-1は無制限。
+const int SEND_TIMEOUT           = 3000; ///< 1回のTcpWrite全体の送信上限時間[秒]。-1は無制限。
+const int TIMEOUT                = RECEIVE_TIMEOUT; ///< 従来コードとの互換用。受信タイムアウトを参照。
+const int HEADER_SIZE    = 8;   ///< ヘッダサイズ(8バイト固定)
+
+#ifndef LINUX
+/**
+ * @brief shutdownモード
+ */
+typedef enum {
+    SHUT_RD = 0,               ///< Read
+    SHUT_WR,                   ///< Write
+    SHUT_RDWR,                 ///< Read & Write
+} E_ShutdownMode;
+#else
+#endif
+
+/**
+ * @brief TCP構造体
+ */
+typedef struct {
+    struct sockaddr_in addr;     ///< アドレス
+    size_t             addr_len; ///< アドレス長
+} S_TcpAddress;
+
+/**
+ * @brief TCPクライアント情報
+ */
+typedef struct {
+    S_TcpAddress local;          ///< ローカル(Client側)アドレス情報
+    S_TcpAddress remote;         ///< リモート(Server側)アドレス情報
+} S_TcpClient;
+
+/**
+ * @brief 送信メッセージ固定部フォーマット
+ */
+typedef struct {
+    char         header[8];      ///< 返信ヘッダ(固定文字列)
+    int          funcId;         ///< 関数ID
+    int          parity1;        ///< パリティ情報1
+    int          parity2;        ///< パリティ情報2
+    int          size;           ///< データサイズ
+    int          cMsg;           ///< 中間メッセージ有無情報(0:なし/1:あり)
+    char         footer[8];      ///< 返信フッタ(固定文字列)
+} S_TcpMsgS;
+
+/**
+ * @brief 中間メッセージ固定部フォーマット
+ */
+typedef struct {
+    char         header[8];      ///< 返信ヘッダ(固定文字列)
+    int          funcId;         ///< 関数ID
+    int          parity1;        ///< パリティ情報1
+    int          parity2;        ///< パリティ情報2
+    int          error;          ///< エラー情報
+    char         footer[8];      ///< 返信フッタ(固定文字列)
+} S_TcpMsgC;
+
+/**
+ * @brief 返信メッセージ固定部フォーマット
+ */
+typedef struct {
+    char         header[8];      ///< 返信ヘッダ(固定文字列)
+    int          funcId;         ///< 関数ID
+    int          parity1;        ///< パリティ情報1
+    int          parity2;        ///< パリティ情報2
+    int          size;           ///< データサイズ
+    int          error;          ///< エラー情報
+    char         footer[8];      ///< 返信フッタ(固定文字列)
+} S_TcpMsgE;
+
+class Client
+{
+public:
+    /**
+     * @brief        コンストラクタ
+     */
+    Client(void);
+    Client(in_addr hostInfo, int portInfo);
+
+    /**
+     * @brief        デストラクタ
+     */
+    ~Client();
+
+    /**
+     * @brief        初期化処理
+     * @param[in]    host        ホスト名
+     * @param[in]    service     サービス名
+     * @param[out]   hostInfo    IPアドレス情報
+     * @param[out]   portInfo    ポート番号情報
+     */
+    void TcpInit(const char *host, const char *service, in_addr *hostInfo, int *portInfo);
+
+    /**
+     * @brief        サーバ接続
+     * @param[inout] sd          ソケットディスクリプタ
+     * @param[in]    connect     接続タイプ(0:常時接続型/1:毎回接続型)
+     */
+    void TcpConnect(int *sd, int connect);
+
+    /**
+     * @brief        サーバからのデータ読み込み
+     *               読み込みは1メッセージ
+     * @param[in]    sd          ソケットディスクリプタ
+     * @param[out]   size        返信データサイズ
+     * @param[out]   data        返信データ
+     * @param[out]   error       エラー情報
+     * @param[out]   header      ヘッダ(固定文字列)
+     * @param[out]   funcId      関数ID
+     * @param[out]   parity1     パリティ情報1
+     * @param[out]   parity2     パリティ情報2
+     */
+    void TcpRead(int sd, int *size, char **data, int *error, char *header, int *funcId, int *parity1, int *parity2);
+
+    /**
+     * @brief        サーバにデータ書き込み
+     * @param[in]    sd          ソケットディスクリプタ
+     * @param[in]    size        送信データサイズ
+     * @param[in]    data        送信データ
+     */
+    void TcpWrite(int sd, int size, char *data);
+
+
+    /**
+     * @brief        サーバ切断
+     * @param[inout] sd          ソケットディスクリプタ
+     * @param[in]    connect     接続タイプ(0:常時接続型/1:毎回接続型)
+     */
+    void TcpClose(int *sd, int connect);
+
+private:
+    S_TcpClient client_;     ///< TCPクライアント情報
+
+    /**
+     * @brief        ホスト名からIPアドレスを取得
+     * @param[in]    host        ホスト名
+     * @param[out]   in_addr     IPアドレス(struct in_addr)
+     */
+    void tcpGetHostByName(const char *host, struct in_addr *in_addr);
+
+    /**
+     * @brief        サービス名からポート番号を取得
+     * @param[in]    service     サービス名
+     * @param[out]   port        ポート番号
+     */
+    void tcpGetServiceByName(const char *service, int *port);
+
+    /**
+     * @brief        connect実行
+     * @param[in]    sd          ソケットディスクリプタ
+     */
+    void tcpConnect(int sd);
+
+    /**
+     * @brief        select実行(読み込み可能待ち)
+     * @param[in]    sd          ソケットディスクリプタ
+     * @param[in]    timeout     タイムアウト時間 [sec]
+     */
+    void tcpSelectRfs(int sd, int timeout);
+
+    /**
+     * @brief        select実行(書き込み可能待ち)
+     * @param[in]    sd          ソケットディスクリプタ
+     * @param[in]    timeout     タイムアウト時間 [sec]
+     */
+    void tcpSelectWfs(int sd, int timeout);
+
+    /**
+     * @brief        select実行(読み書き可能待ち)
+     * @param[in]    sd          ソケットディスクリプタ
+     * @param[in]    timeout     タイムアウト時間 [sec]
+     */
+    void tcpSelect(int sd, int timeout);
+
+    /**
+     * @brief        ノンブロッキングモードに変更
+     * @param[in]    sd          ソケットディスクリプタ
+     */
+    void tcpSetNonBlockingMode(int sd);
+
+    /**
+     * @brief        ブロッキングモードに変更
+     * @param[in]    sd          ソケットディスクリプタ
+     */
+    void tcpSetBlockingMode(int sd);
+
+    /**
+     * @brief        指定したバイトだけデータを受信
+     * @param[in]    sd          ソケットディスクリプタ
+     * @param[in]    size        データサイズ
+     * @param[out]   data        受信データ
+     */
+    void tcpReadBytes(int sd, int size, char *data, const struct timeval& deadline);
+
+    /**
+     * @brief        指定したバイトだけデータを送信
+     * @param[in]    sd          ソケットディスクリプタ
+     * @param[in]    size        データサイズ
+     * @param[in]    data        送信データ
+     */
+    void tcpWriteBytes(int sd, int size, char *data, const struct timeval& deadline);
+};
+
+#endif // __Client_h__
+
+
+----------------------------------------------------------------------------------------------------
+ClientTcpIoWithC.cpp
+----------------------------------------------------------------------------------------------------
+/**
+ * @file    ClientTcpIoWithC.cpp
+ * @author  Copyright(C) Canon Inc. All right reserved.
+ * @date    2014/01/10
+ * @brief   TCP通信処理
+ * @par     説明
+ *  - TCP通信のクライアント側通信部分の機能を実現するクラス
+ *  - (中間メッセージあり)
+ */
+#include <netdb.h>
+#include <cstring>
+#include "IF_ClientTcpIo.hpp"
+#include "Client.hpp"
+#include "TcpUtil.hpp"
+
+// クライアントが並列で実行した場合、TCP情報は処理中に上書きされてしまうため、
+// staticに保存する期間は最小に抑える必要がある。
+S_TcpInfo* ClientTcpIoWithC::staticTcpInfo_;  ///< TCP情報
+int        ClientTcpIoWithC::semId_ = -1;     ///< スレッド間受け渡しパラメータの保護用セマフォID
+
+/**
+ * @brief        コンストラクタ
+ * @param[in]    tcpInfo     TCP情報
+ * @param[in]    fidNum      関数ID数
+ * @param[in]    host        ホスト名
+ * @param[in]    service     サービス名
+ * @param[in]    connect     接続タイプ(0:常時接続型/1:毎回接続型)
+ */
+ClientTcpIoWithC::ClientTcpIoWithC(S_TcpInfo* tcpInfo, int fidNum, const char* host, const char* service)
+	: UtilDetachThread("TcpSendThread", run), tcpInfo_(tcpInfo), host_(host), service_(service)
+{
+	connect_ = TCP_CONNECT; // connectなしコンストラクタは常時接続型扱い
+	if (tcpInfo_->fid == NULL) {
+		tcpInfo_->fidNum = fidNum;
+		tcpInfo_->fid = new S_TcpFuncId [fidNum];
+		for (int i = 0; i < tcpInfo_->fidNum; i++) {
+			tcpInfo_->fid[i].funcId = i + 1;
+			tcpInfo_->fid[i].sts    = E_FuncStsIdle;
+		}
+	}
+}
+ClientTcpIoWithC::ClientTcpIoWithC(S_TcpInfo* tcpInfo, int fidNum, const char* host, const char* service, int connect)
+	: UtilDetachThread("TcpSendThread", run), tcpInfo_(tcpInfo), host_(host), service_(service), connect_(connect)
+{
+	if (tcpInfo_->fid == NULL) {
+		tcpInfo_->fidNum = fidNum;
+		tcpInfo_->fid = new S_TcpFuncId [fidNum];
+		for (int i = 0; i < tcpInfo_->fidNum; i++) {
+			tcpInfo_->fid[i].funcId = i + 1;
+			tcpInfo_->fid[i].sts    = E_FuncStsIdle;
+		}
+	}
+}
+
+/**
+ * @brief        デストラクタ
+ */
+ClientTcpIoWithC::~ClientTcpIoWithC()
+{
+}
+
+/**
+ * @brief        関数実行
+ * @param[in]    id          関数ID
+ * @param[in]    in          入力データ
+ * @param[in]    size        入力データサイズ
+ * @param[in]    timeout     タイムアウト時間 [usec]
+ *
+ * @retval       なし
+ */
+void ClientTcpIoWithC::exec(int id, char* in, int size, int timeout)
+{
+	int err = 0; ///< エラー戻り値
+
+	log_printf(LV_DEBUG, "start\n");
+
+	// 同一関数の連続実行は許可しない
+	if ((getFuncIdSts(tcpInfo_->fid, tcpInfo_->fidNum, id) != E_FuncStsIdle) &&
+			(getFuncIdSts(tcpInfo_->fid, tcpInfo_->fidNum, id) != E_FuncStsFinE)) {
+		log_printf(LV_DEBUG, "same command can't exec.(%d)\n", id);
+		throw ERR_TCPIO_FUNC_STS;
+	}
+
+	// 初回呼出はセマフォ初期化
+	if (tcpInfo_->thread_semId == -1) {
+		tcpInfo_->thread_semId = initSemaphore(Unlock);
+	}
+	if (tcpInfo_->c.semId == -1) {
+		tcpInfo_->c.semId = initSemaphore(Unlock);
+	}
+	if (tcpInfo_->e.semId == -1) {
+		tcpInfo_->e.semId = initSemaphore(Unlock);
+	}
+
+	// スレッド間受け渡しパラメータを保護するためのセマフォ
+	if (semId_ == -1) {
+		semId_ = initSemaphore(Unlock);
+	}
+
+	// セマフォ確保
+	err = getSemaphore(tcpInfo_->thread_semId, timeout);
+	if (err == -1) {
+		log_printf(LV_ERROR, "timeout error.(%d)\n", timeout);
+		postSemaphore(tcpInfo_->thread_semId);
+		throw ERR_TCPIO_TIMEOUT_S;
+	}
+	err = getSemaphore(tcpInfo_->c.semId, timeout);
+	if (err == -1) {
+		log_printf(LV_ERROR, "timeout error.(%d)\n", timeout);
+		throw ERR_TCPIO_TIMEOUT_S;
+	}
+	err = getSemaphore(tcpInfo_->e.semId, timeout);
+	if (err == -1) {
+		log_printf(LV_ERROR, "timeout error.(%d)\n", timeout);
+		throw ERR_TCPIO_TIMEOUT_S;
+	}
+
+	// 初期化処理(IPアドレス情報、ポート番号情報を取得)
+	Client obj;
+	obj.TcpInit(host_, service_, &tcpInfo_->hostInfo, &tcpInfo_->portInfo);
+
+	// 送信メッセージ領域確保
+	// 関数実行毎に確保する
+	if (tcpInfo_->s.in != NULL) {
+		// waitE()で解放が望ましいが、マルチスレッドだと確保～send間で解放されるケースがある
+		delete [] tcpInfo_->s.in;
+		tcpInfo_->s.in = NULL;
+	}
+	int msgSize = SendFixMsgSize + size; // 固定部＋可変部
+	tcpInfo_->s.in = new char [msgSize];
+	if (tcpInfo_->s.in == NULL) {
+		throw ERR_TCPIO_MALLOC;
+	}
+	memset(tcpInfo_->s.in, 0, sizeof(msgSize));
+	log_printf(LV_DEBUG, "msgSize = %d(%d+%d)\n", msgSize, SendFixMsgSize, size);
+
+	// 送信メッセージデータ格納
+	// フォーマットは以下
+	// 8Byte：送信ヘッダ(固定文字列)
+	// 4Byte：関数ID
+	// 8Byte：パリティ情報
+	// 4Byte：データサイズ
+	// 4Byte：中間メッセージ有無情報
+	// 可変 ：送信パラメータ(バイナリ形式)
+	// 8Byte：送信フッタ(固定文字列)
+	struct timeval time;
+	getTime(&time);
+	int n = 7 + size / sizeof(int); // 送信フッタインデックス
+	int* ptr = reinterpret_cast<int*>(tcpInfo_->s.in);
+	memcpy(ptr, "SendHead", 2 * sizeof(int));   // 送信ヘッダ("SendHead")
+	*(ptr + 2) = htonl(id);                     // 関数ID
+	*(ptr + 3) = htonl((int)time.tv_sec);       // パリティ情報1(現在時刻sec部分)
+	*(ptr + 4) = htonl((int)time.tv_usec);      // パリティ情報2(現在時刻usec部分)
+	*(ptr + 5) = htonl(size);                   // データサイズ
+	*(ptr + 6) = htonl(1);                      // 中間メッセージ有無情報(あり)
+	memcpy(ptr + 7, in, size);                  // 送信パラメータ
+	memcpy(ptr + n, "SendFoot", 2 * sizeof(int)); // 送信フッタ("SendFoot")
+	tcpInfo_->s.size  = msgSize;                // 送信メッセージサイズ
+
+	// データ保存
+	setFuncIdSts(tcpInfo_->fid, tcpInfo_->fidNum, E_FuncStsWaitC, id); // C完了待ち
+	tcpInfo_->parity1 = (int)time.tv_sec;  // パリティ情報1
+	tcpInfo_->parity2 = (int)time.tv_usec; // パリティ情報2
+	tcpInfo_->connect = connect_;          // 接続タイプ(0:常時接続型/1:毎回接続型)
+	log_printf(LV_DEBUG, "parity1=%d, parity2=%d\n", tcpInfo_->parity1, tcpInfo_->parity2);
+
+	// TCP情報をstaticに保持する。
+	// クライアントが並列で実行した場合、TCP情報は処理中に上書きされてしまうため、
+	// スレッド処理開始直後にauto変数に退避する。
+	// 受け渡しが終るまでセマフォで保護する。
+	err = getSemaphore(semId_, timeout);
+	if (err == -1) {
+		log_printf(LV_ERROR, "timeout error.(%d)\n", timeout);
+		throw ERR_TCPIO_TIMEOUT_S;
+	}
+	staticTcpInfo_ = tcpInfo_;
+
+	// スレッド処理開始。run()を別スレッドで実行する。
+	start();
+
+	log_printf(LV_DEBUG, "end\n");
+
+	return;
+}
+
+/**
+ * @brief        スレッドで実行する処理
+ *               スレッド処理が並列で動作することはない
+ *
+ * @retval       なし
+ */
+void ClientTcpIoWithC::run()
+{
+	const int RETRY_MAX = 30;        ///< メッセージ受信リトライ最大回数
+	int       retry = 0;             ///< リトライループカウンタ
+	char      header[HEADER_SIZE + 1]; ///< ヘッダ(固定文字列)
+	int       funcId  = 0;           ///<  関数ID
+	int       l_fid   = 0;           ///<  関数ID
+	int       parity1 = 0;           ///<  パリティ情報1
+	int       parity2 = 0;           ///<  パリティ情報2
+	Client*    client = NULL;        ///< クライアントクラス
+	bool      c_sem   = false;       ///< c.semId解放確認
+	bool      e_sem   = false;       ///< e.semId解放確認
+	bool      th_sem  = false;       ///< thread_semId解放確認
+
+	log_printf(LV_DEBUG, "start\n");
+
+	// static情報をauto変数に退避。
+	// TCP情報が格納されている領域は、呼び出し元でstaticに確保している前提。
+	S_TcpInfo* tcpInfo = staticTcpInfo_;
+	l_fid = getFuncId(tcpInfo->fid, tcpInfo->fidNum);
+
+	// 退避中はセマフォで保護
+	postSemaphore(semId_);
+
+	try {
+		client = new Client(tcpInfo->hostInfo, tcpInfo->portInfo);
+
+		// サーバ接続
+		client->TcpConnect(&tcpInfo->sd, tcpInfo->connect);
+
+		// サーバに送信メッセージ送信
+		client->TcpWrite(tcpInfo->sd, tcpInfo->s.size, tcpInfo->s.in);
+
+		// 中間メッセージ受信
+		for (retry = 0; retry < RETRY_MAX; retry++) {
+
+			// サーバから1メッセージ読み込み、送信メッセージに対する返信メッセージかをチェック
+			memset(header, 0, sizeof(header));
+			client->TcpRead(tcpInfo->sd, &tcpInfo->e.size, &tcpInfo->e.out, &tcpInfo->c.rtn,
+							header, &funcId, &parity1, &parity2);
+			if (checkMsg(MSG_TYPE_WITHC_C, l_fid, tcpInfo->parity1, tcpInfo->parity2,
+						 header, funcId, parity1, parity2) == true) {
+				break;
+			}
+
+			// 本スレッドがタイムアウト等で終了している場合は速やかに終了する
+			if (getFuncIdSts(tcpInfo->fid, tcpInfo->fidNum, l_fid) == E_FuncStsIdle) {
+				log_printf(LV_DEBUG, "this function must not continue.\n");
+				throw ERR_TCPIO_RECEIVE;
+			}
+
+			// 規定回数メッセージを読み込んでも該当しない場合はエラーとする
+			if (retry == RETRY_MAX - 1) {
+				log_printf(LV_ERROR, "receive retry max error.(%d)\n", retry);
+				throw ERR_TCPIO_RECEIVE;
+			}
+		}
+
+		// セマフォ解放
+		postSemaphore(tcpInfo->c.semId);
+		c_sem  = true;
+
+		// 返信メッセージ受信
+		for (retry = 0; retry < RETRY_MAX; retry++) {
+
+			// サーバから1メッセージ読み込み、送信メッセージに対する返信メッセージかをチェック
+			memset(header, 0, sizeof(header));
+			client->TcpRead(tcpInfo->sd, &tcpInfo->e.size, &tcpInfo->e.out, &tcpInfo->e.rtn,
+							header, &funcId, &parity1, &parity2);
+			if (checkMsg(MSG_TYPE_WITHC_E, l_fid, tcpInfo->parity1, tcpInfo->parity2,
+						 header, funcId, parity1, parity2) == true) {
+				break;
+			}
+
+			// 本スレッドがタイムアウト等で終了している場合は速やかに終了する
+			if (getFuncIdSts(tcpInfo->fid, tcpInfo->fidNum, l_fid) == E_FuncStsIdle) {
+				log_printf(LV_DEBUG, "this function must not continue.\n");
+				throw ERR_TCPIO_RECEIVE;
+			}
+
+			// 規定回数メッセージを読み込んでも該当しない場合はエラーとする
+			if (retry == RETRY_MAX - 1) {
+				log_printf(LV_ERROR, "receive retry max error.(%d)\n", retry);
+				throw ERR_TCPIO_RECEIVE;
+			}
+		}
+
+		// 関数の戻り値チェック
+		if (tcpInfo->e.rtn != 0) {
+			log_printf(LV_ERROR, "exec function rtn error.(%d)\n", tcpInfo->e.rtn);
+			throw tcpInfo->e.rtn;
+		}
+
+		// 関数終了
+		setFuncIdSts(tcpInfo->fid, tcpInfo->fidNum, E_FuncStsFinE, l_fid); // E完了
+
+		// サーバ切断
+		client->TcpClose(&tcpInfo->sd, tcpInfo->connect);
+
+		// セマフォ解放
+		postSemaphore(tcpInfo->e.semId);
+		e_sem  = true;
+		th_sem = true;
+
+		delete client;
+	}
+	catch (int error) {
+		log_printf(LV_ERROR, "error.(0x%x)\n", error);
+		setFuncIdSts(tcpInfo->fid, tcpInfo->fidNum, E_FuncStsFinE, l_fid);
+		client->TcpClose(&tcpInfo->sd, TCP_DISCONNECT);
+		tcpInfo->c.rtn = error;
+		tcpInfo->e.rtn = error;
+		if (!c_sem)  postSemaphore(tcpInfo->c.semId);
+		if (!e_sem)  postSemaphore(tcpInfo->e.semId);
+		if (!th_sem) postSemaphore(tcpInfo->thread_semId);
+		delete client;
+		throw error;
+	}
+	catch (...) {
+		log_printf(LV_ERROR, "error.\n");
+		setFuncIdSts(tcpInfo->fid, tcpInfo->fidNum, E_FuncStsFinE, l_fid);
+		client->TcpClose(&tcpInfo->sd, TCP_DISCONNECT);
+		tcpInfo->c.rtn = -1;
+		tcpInfo->e.rtn = -1;
+		if (!c_sem)  postSemaphore(tcpInfo->c.semId);
+		if (!e_sem)  postSemaphore(tcpInfo->e.semId);
+		if (!th_sem) postSemaphore(tcpInfo->thread_semId);
+		delete client;
+		throw - 1;
+	}
+
+	log_printf(LV_DEBUG, "end\n");
+
+	return;
+}
+
+/**
+ * @brief        中間メッセージ受信
+ * @param[in]    id          関数ID
+ * @param[in]    timeout     タイムアウト時間 [usec]
+ *
+ * @retval       なし
+ */
+int ClientTcpIoWithC::waitC(int id, int timeout)
+{
+	int err = 0; ///< エラー戻り値
+
+	log_printf(LV_DEBUG, "start\n");
+
+	// 関数実行状態チェック
+	// C()完了待ちでないとC()は実行できない
+	if ((getFuncIdSts(tcpInfo_->fid, tcpInfo_->fidNum, id) != E_FuncStsWaitC) &&
+			(getFuncIdSts(tcpInfo_->fid, tcpInfo_->fidNum, id) != E_FuncStsFinE)) {
+		log_printf(LV_DEBUG, "funcStatus is wrong.(%d)\n", getFuncIdSts(tcpInfo_->fid, tcpInfo_->fidNum, id));
+		throw ERR_TCPIO_FUNC_STS;
+	}
+
+	// セマフォ確保
+	err = getSemaphore(tcpInfo_->c.semId, timeout);
+	if (err == -1) {
+		log_printf(LV_ERROR, "timeout error.(%d)\n", timeout);
+		setFuncIdSts(tcpInfo_->fid, tcpInfo_->fidNum, E_FuncStsIdle, id);
+		postSemaphore(tcpInfo_->thread_semId);
+		throw ERR_TCPIO_TIMEOUT_C;
+	}
+
+	// セマフォ解放
+	postSemaphore(tcpInfo_->c.semId);
+
+	// 関数実行状態変更
+	setFuncIdSts(tcpInfo_->fid, tcpInfo_->fidNum, E_FuncStsWaitE, id);
+
+	log_printf(LV_DEBUG, "end\n");
+
+	return tcpInfo_->c.rtn;
+}
+
+/**
+ * @brief        終了メッセージ受信
+ * @param[in]    id          関数ID
+ * @param[out]   out         出力データ
+ * @param[in]    size        出力データサイズ
+ * @param[in]    timeout     タイムアウト時間 [usec]
+ *
+ * @retval       なし
+ */
+void ClientTcpIoWithC::waitE(int id, char* out, int size, int timeout)
+{
+	int err = 0; ///< エラー戻り値
+
+	log_printf(LV_DEBUG, "start\n");
+
+	// 関数実行状態チェック
+	// E()完了待ちでないとE()は実行できない
+	if ((getFuncIdSts(tcpInfo_->fid, tcpInfo_->fidNum, id) != E_FuncStsWaitE) &&
+			(getFuncIdSts(tcpInfo_->fid, tcpInfo_->fidNum, id) != E_FuncStsFinE)) {
+		// ただし、同一関数の場合はC()が実行されていなかった場合はwaitC()を呼び処理を継続する
+		if (getFuncIdSts(tcpInfo_->fid, tcpInfo_->fidNum, id) == E_FuncStsWaitC) {
+			log_printf(LV_DEBUG, "not call waitC\n");
+			waitC(id, timeout);
+		}
+		else {
+			log_printf(LV_DEBUG, "funcStatus is wrong.(%d)\n", getFuncIdSts(tcpInfo_->fid, tcpInfo_->fidNum, id));
+			throw ERR_TCPIO_FUNC_STS;
+		}
+	}
+
+	// セマフォ確保
+	err = getSemaphore(tcpInfo_->e.semId, timeout);
+	if (err == -1) {
+		log_printf(LV_ERROR, "timeout error.(%d)\n", timeout);
+		setFuncIdSts(tcpInfo_->fid, tcpInfo_->fidNum, E_FuncStsIdle, id);
+		postSemaphore(tcpInfo_->thread_semId);
+		throw ERR_TCPIO_TIMEOUT_E;
+	}
+
+	// セマフォ解放
+	postSemaphore(tcpInfo_->e.semId);
+	postSemaphore(tcpInfo_->thread_semId);
+
+	// 関数実行状態変更
+	setFuncIdSts(tcpInfo_->fid, tcpInfo_->fidNum, E_FuncStsIdle, id);
+
+	// 出力データ受け取り
+	if (tcpInfo_->e.out != NULL) {
+		memcpy(out, tcpInfo_->e.out, size);
+	}
+
+	// 関数戻り値チェック
+	if (tcpInfo_->e.rtn != 0) {
+		throw tcpInfo_->e.rtn;
+	}
+
+	log_printf(LV_DEBUG, "end\n");
+
+	return;
+}
+
+/**
+ * @brief        メッセージチェック
+ * @param[in]    msgType     メッセージタイプ
+ * @param[in]    inFuncId    入力関数ID
+ * @param[in]    inParity1   入力パリティ情報1
+ * @param[in]    inParity2   入力パリティ情報2
+ * @param[in]    outHeader   出力ヘッダ
+ * @param[in]    outFuncId   出力関数ID
+ * @param[in]    outParity1  出力パリティ情報1
+ * @param[in]    outParity2  出力パリティ情報2
+ *
+ * @retval       true        メッセージ一致
+ * @retval       false       メッセージ不一致
+ */
+bool ClientTcpIoWithC::checkMsg(E_MsgTypeWithC msgType, int inFuncId, int inParity1, int inParity2,
+								char* outHeader, int outFuncId, int outParity1, int outParity2)
+{
+	// ヘッダが一致しているか？
+	switch (msgType) {
+	case MSG_TYPE_WITHC_S:
+		if (strcmp(outHeader, "SendHead") != 0) {
+			log_printf(LV_DEBUG, "header no match(SendHead vs %s)\n", outHeader);
+			return false;
+		}
+		break;
+	case MSG_TYPE_WITHC_C:
+		if (strcmp(outHeader, "InfmHead") != 0) {
+			log_printf(LV_DEBUG, "header no match(InfmHead vs %s)\n", outHeader);
+			return false;
+		}
+		break;
+	case MSG_TYPE_WITHC_E:
+		if (strcmp(outHeader, "RecvHead") != 0) {
+			log_printf(LV_DEBUG, "header no match(RecvHead vs %s)\n", outHeader);
+			return false;
+		}
+		break;
+	}
+
+	// 関数IDが一致しているか？
+	if (inFuncId != outFuncId) {
+		log_printf(LV_DEBUG, "funcId no match(%d vs %d)\n", inFuncId, outFuncId);
+		return false;
+	}
+
+	// パリティ情報1が一致しているか？
+	if (inParity1 != outParity1) {
+		log_printf(LV_DEBUG, "parity1 no match(%d vs %d)\n", inParity1, outParity1);
+		return false;
+	}
+
+	// パリティ情報2が一致しているか？
+	if (inParity2 != outParity2) {
+		log_printf(LV_DEBUG, "parity2 no match(%d vs %d)\n", inParity2, outParity2);
+		return false;
+	}
+
+	return true;
+}
+
+/**
+ * @brief        関数実行状態取得
+ * @param[in]    fid         関数ID情報
+ * @param[in]    fidNum      関数ID数
+ * @param[in]    funcId      関数ID
+ *
+ * @retval       関数実行状態(0:Idle状態/1:C完了待ち/2:E完了待ち/3:E完了)
+ */
+E_FuncSts ClientTcpIoWithC::getFuncIdSts(S_TcpFuncId* fid, int fidNum, int funcId)
+{
+	E_FuncSts sts = E_FuncStsIdle;
+
+	for (int i = 0; i < fidNum; i++) {
+		if (funcId == fid[i].funcId) {
+			sts = fid[i].sts;
+		}
+	}
+	return sts;
+}
+
+/**
+ * @brief        関数実行状態設定
+ * @param[inout] fid         関数ID情報
+ * @param[in]    fidNum      関数ID数
+ * @param[in]    sts         関数実行状態(0:Idle状態/1:C完了待ち/2:E完了待ち/3:E完了)
+ * @param[in]    funcId      関数ID
+ *
+ * @retval       なし
+ */
+void ClientTcpIoWithC::setFuncIdSts(S_TcpFuncId* fid, int fidNum, E_FuncSts sts, int funcId)
+{
+	for (int i = 0; i < fidNum; i++) {
+		if (funcId == fid[i].funcId) {
+			fid[i].sts = sts;
+			log_printf(LV_DEBUG, "funcStatus(fid:%d) = %d\n", i + 1, fid[i].sts);
+		}
+	}
+	return;
+}
+
+/**
+ * @brief        関数ID取得
+ * @param[in]    fid         関数ID情報
+ * @param[in]    fidNum      関数ID数
+ *
+ * @retval       関数ID
+ */
+int ClientTcpIoWithC::getFuncId(S_TcpFuncId* fid, int fidNum)
+{
+	int funcId = 0;
+
+	// 実行中の関数は同時には1つしかないことを前提として
+	// 現在実行中の関数IDを取得する
+	for (int i = 0; i < fidNum; i++) {
+		if ((fid[i].sts != E_FuncStsIdle) &&
+				(fid[i].sts != E_FuncStsFinE)) {
+			funcId = fid[i].funcId;
+		}
+	}
+	return funcId;
+}
+
+
+----------------------------------------------------------------------------------------------------
+/**
+ * @file    ClientTcpIoWithC.cpp
+ * @author  Copyright(C) Canon Inc. All right reserved.
+ * @date    2014/01/10
+ * @brief   TCP通信処理
+ * @par     説明
+ *  - TCP通信のクライアント側通信部分の機能を実現するクラス
+ *  - (中間メッセージあり)
+ */
+#include <netdb.h>
+#include <cstring>
+#include "IF_ClientTcpIo.hpp"
+#include "Client.hpp"
+#include "TcpUtil.hpp"
+
+// クライアントが並列で実行した場合、TCP情報は処理中に上書きされてしまうため、
+// staticに保存する期間は最小に抑える必要がある。
+S_TcpInfo* ClientTcpIoWithC::staticTcpInfo_;  ///< TCP情報
+int        ClientTcpIoWithC::semId_ = -1;     ///< スレッド間受け渡しパラメータの保護用セマフォID
+
+/**
+ * @brief        コンストラクタ
+ * @param[in]    tcpInfo     TCP情報
+ * @param[in]    fidNum      関数ID数
+ * @param[in]    host        ホスト名
+ * @param[in]    service     サービス名
+ * @param[in]    connect     接続タイプ(0:常時接続型/1:毎回接続型)
+ */
+ClientTcpIoWithC::ClientTcpIoWithC(S_TcpInfo* tcpInfo, int fidNum, const char* host, const char* service)
+	: UtilDetachThread("TcpSendThread", run), tcpInfo_(tcpInfo), host_(host), service_(service)
+{
+	connect_ = TCP_CONNECT; // connectなしコンストラクタは常時接続型扱い
+	if (tcpInfo_->fid == NULL) {
+		tcpInfo_->fidNum = fidNum;
+		tcpInfo_->fid = new S_TcpFuncId [fidNum];
+		for (int i = 0; i < tcpInfo_->fidNum; i++) {
+			tcpInfo_->fid[i].funcId = i + 1;
+			tcpInfo_->fid[i].sts    = E_FuncStsIdle;
+		}
+	}
+}
+ClientTcpIoWithC::ClientTcpIoWithC(S_TcpInfo* tcpInfo, int fidNum, const char* host, const char* service, int connect)
+	: UtilDetachThread("TcpSendThread", run), tcpInfo_(tcpInfo), host_(host), service_(service), connect_(connect)
+{
+	if (tcpInfo_->fid == NULL) {
+		tcpInfo_->fidNum = fidNum;
+		tcpInfo_->fid = new S_TcpFuncId [fidNum];
+		for (int i = 0; i < tcpInfo_->fidNum; i++) {
+			tcpInfo_->fid[i].funcId = i + 1;
+			tcpInfo_->fid[i].sts    = E_FuncStsIdle;
+		}
+	}
+}
+
+/**
+ * @brief        デストラクタ
+ */
+ClientTcpIoWithC::~ClientTcpIoWithC()
+{
+}
+
+/**
+ * @brief        関数実行
+ * @param[in]    id          関数ID
+ * @param[in]    in          入力データ
+ * @param[in]    size        入力データサイズ
+ * @param[in]    timeout     タイムアウト時間 [usec]
+ *
+ * @retval       なし
+ */
+void ClientTcpIoWithC::exec(int id, char* in, int size, int timeout)
+{
+	int err = 0; ///< エラー戻り値
+
+	log_printf(LV_DEBUG, "start\n");
+
+	// 同一関数の連続実行は許可しない
+	if ((getFuncIdSts(tcpInfo_->fid, tcpInfo_->fidNum, id) != E_FuncStsIdle) &&
+			(getFuncIdSts(tcpInfo_->fid, tcpInfo_->fidNum, id) != E_FuncStsFinE)) {
+		log_printf(LV_DEBUG, "same command can't exec.(%d)\n", id);
+		throw ERR_TCPIO_FUNC_STS;
+	}
+
+	// 初回呼出はセマフォ初期化
+	if (tcpInfo_->thread_semId == -1) {
+		tcpInfo_->thread_semId = initSemaphore(Unlock);
+	}
+	if (tcpInfo_->c.semId == -1) {
+		tcpInfo_->c.semId = initSemaphore(Unlock);
+	}
+	if (tcpInfo_->e.semId == -1) {
+		tcpInfo_->e.semId = initSemaphore(Unlock);
+	}
+
+	// スレッド間受け渡しパラメータを保護するためのセマフォ
+	if (semId_ == -1) {
+		semId_ = initSemaphore(Unlock);
+	}
+
+	// セマフォ確保
+	err = getSemaphore(tcpInfo_->thread_semId, timeout);
+	if (err == -1) {
+		log_printf(LV_ERROR, "timeout error.(%d)\n", timeout);
+		postSemaphore(tcpInfo_->thread_semId);
+		throw ERR_TCPIO_TIMEOUT_S;
+	}
+	err = getSemaphore(tcpInfo_->c.semId, timeout);
+	if (err == -1) {
+		log_printf(LV_ERROR, "timeout error.(%d)\n", timeout);
+		throw ERR_TCPIO_TIMEOUT_S;
+	}
+	err = getSemaphore(tcpInfo_->e.semId, timeout);
+	if (err == -1) {
+		log_printf(LV_ERROR, "timeout error.(%d)\n", timeout);
+		throw ERR_TCPIO_TIMEOUT_S;
+	}
+
+	// 初期化処理(IPアドレス情報、ポート番号情報を取得)
+	Client obj;
+	obj.TcpInit(host_, service_, &tcpInfo_->hostInfo, &tcpInfo_->portInfo);
+
+	// 送信メッセージ領域確保
+	// 関数実行毎に確保する
+	if (tcpInfo_->s.in != NULL) {
+		// waitE()で解放が望ましいが、マルチスレッドだと確保〜send間で解放されるケースがある
+		delete [] tcpInfo_->s.in;
+		tcpInfo_->s.in = NULL;
+	}
+	int msgSize = SendFixMsgSize + size; // 固定部＋可変部
+	tcpInfo_->s.in = new char [msgSize];
+	if (tcpInfo_->s.in == NULL) {
+		throw ERR_TCPIO_MALLOC;
+	}
+	memset(tcpInfo_->s.in, 0, sizeof(msgSize));
+	log_printf(LV_DEBUG, "msgSize = %d(%d+%d)\n", msgSize, SendFixMsgSize, size);
+
+	// 送信メッセージデータ格納
+	// フォーマットは以下
+	// 8Byte：送信ヘッダ(固定文字列)
+	// 4Byte：関数ID
+	// 8Byte：パリティ情報
+	// 4Byte：データサイズ
+	// 4Byte：中間メッセージ有無情報
+	// 可変 ：送信パラメータ(バイナリ形式)
+	// 8Byte：送信フッタ(固定文字列)
+	struct timeval time;
+	getTime(&time);
+	int n = 7 + size / sizeof(int); // 送信フッタインデックス
+	int* ptr = reinterpret_cast<int*>(tcpInfo_->s.in);
+	memcpy(ptr, "SendHead", 2 * sizeof(int));   // 送信ヘッダ("SendHead")
+	*(ptr + 2) = htonl(id);                     // 関数ID
+	*(ptr + 3) = htonl((int)time.tv_sec);       // パリティ情報1(現在時刻sec部分)
+	*(ptr + 4) = htonl((int)time.tv_usec);      // パリティ情報2(現在時刻usec部分)
+	*(ptr + 5) = htonl(size);                   // データサイズ
+	*(ptr + 6) = htonl(1);                      // 中間メッセージ有無情報(あり)
+	memcpy(ptr + 7, in, size);                  // 送信パラメータ
+	memcpy(ptr + n, "SendFoot", 2 * sizeof(int)); // 送信フッタ("SendFoot")
+	tcpInfo_->s.size  = msgSize;                // 送信メッセージサイズ
+
+	// データ保存
+	setFuncIdSts(tcpInfo_->fid, tcpInfo_->fidNum, E_FuncStsWaitC, id); // C完了待ち
+	tcpInfo_->parity1 = (int)time.tv_sec;  // パリティ情報1
+	tcpInfo_->parity2 = (int)time.tv_usec; // パリティ情報2
+	tcpInfo_->connect = connect_;          // 接続タイプ(0:常時接続型/1:毎回接続型)
+	log_printf(LV_DEBUG, "parity1=%d, parity2=%d\n", tcpInfo_->parity1, tcpInfo_->parity2);
+
+	// TCP情報をstaticに保持する。
+	// クライアントが並列で実行した場合、TCP情報は処理中に上書きされてしまうため、
+	// スレッド処理開始直後にauto変数に退避する。
+	// 受け渡しが終るまでセマフォで保護する。
+	err = getSemaphore(semId_, timeout);
+	if (err == -1) {
+		log_printf(LV_ERROR, "timeout error.(%d)\n", timeout);
+		throw ERR_TCPIO_TIMEOUT_S;
+	}
+	staticTcpInfo_ = tcpInfo_;
+
+	// スレッド処理開始。run()を別スレッドで実行する。
+	start();
+
+	log_printf(LV_DEBUG, "end\n");
+
+	return;
+}
+
+/**
+ * @brief        スレッドで実行する処理
+ *               スレッド処理が並列で動作することはない
+ *
+ * @retval       なし
+ */
+void ClientTcpIoWithC::run()
+{
+	const int RETRY_MAX = 30;        ///< メッセージ受信リトライ最大回数
+	int       retry = 0;             ///< リトライループカウンタ
+	char      header[HEADER_SIZE + 1]; ///< ヘッダ(固定文字列)
+	int       funcId  = 0;           ///<  関数ID
+	int       l_fid   = 0;           ///<  関数ID
+	int       parity1 = 0;           ///<  パリティ情報1
+	int       parity2 = 0;           ///<  パリティ情報2
+	Client*    client = NULL;        ///< クライアントクラス
+	bool      c_sem   = false;       ///< c.semId解放確認
+	bool      e_sem   = false;       ///< e.semId解放確認
+	bool      th_sem  = false;       ///< thread_semId解放確認
+
+	log_printf(LV_DEBUG, "start\n");
+
+	// static情報をauto変数に退避。
+	// TCP情報が格納されている領域は、呼び出し元でstaticに確保している前提。
+	S_TcpInfo* tcpInfo = staticTcpInfo_;
+	l_fid = getFuncId(tcpInfo->fid, tcpInfo->fidNum);
+
+	// 退避中はセマフォで保護
+	postSemaphore(semId_);
+
+	try {
+		client = new Client(tcpInfo->hostInfo, tcpInfo->portInfo);
+
+		// サーバ接続
+		client->TcpConnect(&tcpInfo->sd, tcpInfo->connect);
+
+		// 目的: 接続待ち中に呼び出し元がタイムアウトした場合、不要な送受信を開始しない。
+		// 処理: 都度接続モードで関数状態がIdleなら、共通の例外後始末へ進む。
+		if ((tcpInfo->connect == TCP_DISCONNECT) &&
+				// 呼び出し側が待ちを打ち切った状態か確認する。
+				(getFuncIdSts(tcpInfo->fid, tcpInfo->fidNum, l_fid) == E_FuncStsIdle)) {
+			// 後続の通信を中止し、例外処理でFDを閉じる。
+			throw ERR_TCPIO_FUNC_STS;
+		}
+
+		// サーバに送信メッセージ送信
+		client->TcpWrite(tcpInfo->sd, tcpInfo->s.size, tcpInfo->s.in);
+
+		// 目的: 送信中に呼び出し元がタイムアウトした場合、応答受信待ちへ進まない。
+		// 処理: 都度接続モードでIdleを検出し、共通の例外後始末でソケットを閉じる。
+		if ((tcpInfo->connect == TCP_DISCONNECT) &&
+				// 送信中に呼び出し側がタイムアウト状態へ変更したか確認する。
+				(getFuncIdSts(tcpInfo->fid, tcpInfo->fidNum, l_fid) == E_FuncStsIdle)) {
+			// 通信を中止し、後続のクローズ処理へ移す。
+			throw ERR_TCPIO_FUNC_STS;
+		}
+
+		// 中間メッセージ受信
+		for (retry = 0; retry < RETRY_MAX; retry++) {
+
+			// サーバから1メッセージ読み込み、送信メッセージに対する返信メッセージかをチェック
+			memset(header, 0, sizeof(header));
+			client->TcpRead(tcpInfo->sd, &tcpInfo->e.size, &tcpInfo->e.out, &tcpInfo->c.rtn,
+							header, &funcId, &parity1, &parity2);
+			if (checkMsg(MSG_TYPE_WITHC_C, l_fid, tcpInfo->parity1, tcpInfo->parity2,
+						 header, funcId, parity1, parity2) == true) {
+				break;
+			}
+
+			// 本スレッドがタイムアウト等で終了している場合は速やかに終了する
+			if (getFuncIdSts(tcpInfo->fid, tcpInfo->fidNum, l_fid) == E_FuncStsIdle) {
+				log_printf(LV_DEBUG, "this function must not continue.\n");
+				throw ERR_TCPIO_RECEIVE;
+			}
+
+			// 規定回数メッセージを読み込んでも該当しない場合はエラーとする
+			if (retry == RETRY_MAX - 1) {
+				log_printf(LV_ERROR, "receive retry max error.(%d)\n", retry);
+				throw ERR_TCPIO_RECEIVE;
+			}
+		}
+
+		// セマフォ解放
+		postSemaphore(tcpInfo->c.semId);
+		c_sem  = true;
+
+		// 返信メッセージ受信
+		for (retry = 0; retry < RETRY_MAX; retry++) {
+
+			// サーバから1メッセージ読み込み、送信メッセージに対する返信メッセージかをチェック
+			memset(header, 0, sizeof(header));
+			client->TcpRead(tcpInfo->sd, &tcpInfo->e.size, &tcpInfo->e.out, &tcpInfo->e.rtn,
+							header, &funcId, &parity1, &parity2);
+			if (checkMsg(MSG_TYPE_WITHC_E, l_fid, tcpInfo->parity1, tcpInfo->parity2,
+						 header, funcId, parity1, parity2) == true) {
+				break;
+			}
+
+			// 本スレッドがタイムアウト等で終了している場合は速やかに終了する
+			if (getFuncIdSts(tcpInfo->fid, tcpInfo->fidNum, l_fid) == E_FuncStsIdle) {
+				log_printf(LV_DEBUG, "this function must not continue.\n");
+				throw ERR_TCPIO_RECEIVE;
+			}
+
+			// 規定回数メッセージを読み込んでも該当しない場合はエラーとする
+			if (retry == RETRY_MAX - 1) {
+				log_printf(LV_ERROR, "receive retry max error.(%d)\n", retry);
+				throw ERR_TCPIO_RECEIVE;
+			}
+		}
+
+		// 関数の戻り値チェック
+		if (tcpInfo->e.rtn != 0) {
+			log_printf(LV_ERROR, "exec function rtn error.(%d)\n", tcpInfo->e.rtn);
+			throw tcpInfo->e.rtn;
+		}
+
+		// 関数終了
+		setFuncIdSts(tcpInfo->fid, tcpInfo->fidNum, E_FuncStsFinE, l_fid); // E完了
+
+		// サーバ切断
+		client->TcpClose(&tcpInfo->sd, tcpInfo->connect);
+
+		// セマフォ解放
+		postSemaphore(tcpInfo->e.semId);
+		e_sem  = true;
+		th_sem = true;
+
+		delete client;
+	}
+	catch (int error) {
+		// 整数エラーを記録し、C/Eセマフォとソケットの後始末を行う。
+		log_printf(LV_ERROR, "error.(0x%x)\n", error);
+		// 目的: タイムアウト側とワーカー側のFDリーク・セマフォ二重解放を防ぐ。
+		// IdleならwaitCまたはwaitEがすでにタイムアウト処理を開始している。
+		bool callerTimedOut = (getFuncIdSts(tcpInfo->fid, tcpInfo->fidNum, l_fid) == E_FuncStsIdle);
+		// 呼び出し元へエラー完了を伝えるため、関数状態を完了状態に更新する。
+		setFuncIdSts(tcpInfo->fid, tcpInfo->fidNum, E_FuncStsFinE, l_fid);
+		// ClientとFDが有効なときだけ、都度接続したソケットを閉じる。
+		if ((client != NULL) && (tcpInfo->sd >= 0)) {
+			// TCP_DISCONNECTでshutdown/closeし、共有FDを無効化する。
+			client->TcpClose(&tcpInfo->sd, TCP_DISCONNECT);
+		}
+		// C完了待ちへ今回のエラーを返すため、戻り値領域へ保存する。
+		tcpInfo->c.rtn = error;
+		// E完了待ちへも同じエラーを返せるよう、戻り値領域へ保存する。
+		tcpInfo->e.rtn = error;
+		// C完了セマフォをまだ通知していない場合だけ、待ち側へ通知する。
+		if (!c_sem)  postSemaphore(tcpInfo->c.semId);
+		// E完了セマフォをまだ通知していない場合だけ、待ち側へ通知する。
+		if (!e_sem)  postSemaphore(tcpInfo->e.semId);
+		// タイムアウト側が解放済みでない場合だけthreadセマフォを解放する。
+		if (!th_sem && !callerTimedOut) postSemaphore(tcpInfo->thread_semId);
+		// ワーカースレッドが作成したClientオブジェクトを破棄する。
+		delete client;
+		// 元の整数エラーを維持して呼び出し元へ返す。
+		throw error;
+	}
+	catch (...) {
+		// 整数以外の例外も記録し、同じ資源解放経路で処理する。
+		log_printf(LV_ERROR, "error.\n");
+		// 目的: 想定外の例外でもFDリークとセマフォ二重解放を防ぐ。
+		// IdleならwaitCまたはwaitEがすでにタイムアウト処理を開始している。
+		bool callerTimedOut = (getFuncIdSts(tcpInfo->fid, tcpInfo->fidNum, l_fid) == E_FuncStsIdle);
+		// 呼び出し元へ終了を伝えるため、関数状態を完了状態に更新する。
+		setFuncIdSts(tcpInfo->fid, tcpInfo->fidNum, E_FuncStsFinE, l_fid);
+		// ClientとFDが有効な場合だけ、都度接続したソケットを閉じる。
+		if ((client != NULL) && (tcpInfo->sd >= 0)) {
+			// TCP_DISCONNECTでソケットを閉じ、共有FDを無効化する。
+			client->TcpClose(&tcpInfo->sd, TCP_DISCONNECT);
+		}
+		// C完了待ちへ汎用エラーを返すため、戻り値領域へ保存する。
+		tcpInfo->c.rtn = -1;
+		// E完了待ちへ汎用エラーを返すため、戻り値領域へ保存する。
+		tcpInfo->e.rtn = -1;
+		// C完了セマフォが未通知の場合だけ、待ち側へ通知する。
+		if (!c_sem)  postSemaphore(tcpInfo->c.semId);
+		// E完了セマフォが未通知の場合だけ、待ち側へ通知する。
+		if (!e_sem)  postSemaphore(tcpInfo->e.semId);
+		// タイムアウト側が解放済みでない場合だけthreadセマフォを解放する。
+		if (!th_sem && !callerTimedOut) postSemaphore(tcpInfo->thread_semId);
+		// ワーカースレッドが作成したClientオブジェクトを破棄する。
+		delete client;
+		// 想定外の例外を汎用エラー値に置き換えて呼び出し元へ返す。
+		throw - 1;
+	}
+
+	log_printf(LV_DEBUG, "end\n");
+
+	return;
+}
+
+/**
+ * @brief        中間メッセージ受信
+ * @param[in]    id          関数ID
+ * @param[in]    timeout     タイムアウト時間 [usec]
+ *
+ * @retval       なし
+ */
+int ClientTcpIoWithC::waitC(int id, int timeout)
+{
+	int err = 0; ///< エラー戻り値
+
+	log_printf(LV_DEBUG, "start\n");
+
+	// 関数実行状態チェック
+	// C()完了待ちでないとC()は実行できない
+	if ((getFuncIdSts(tcpInfo_->fid, tcpInfo_->fidNum, id) != E_FuncStsWaitC) &&
+			(getFuncIdSts(tcpInfo_->fid, tcpInfo_->fidNum, id) != E_FuncStsFinE)) {
+		log_printf(LV_DEBUG, "funcStatus is wrong.(%d)\n", getFuncIdSts(tcpInfo_->fid, tcpInfo_->fidNum, id));
+		throw ERR_TCPIO_FUNC_STS;
+	}
+
+	// セマフォ確保
+	err = getSemaphore(tcpInfo_->c.semId, timeout);
+	if (err == -1) {
+		// 指定時間内に中間メッセージ完了セマフォを取得できなかったことを記録する。
+		log_printf(LV_ERROR, "timeout error.(%d)\n", timeout);
+		// ワーカースレッドへタイムアウトを知らせ、受信処理を終了させる。
+		setFuncIdSts(tcpInfo_->fid, tcpInfo_->fidNum, E_FuncStsIdle, id);
+		// 目的: C待ちタイムアウト時にrecvを解除し、ワーカーに都度接続FDを閉じさせる。
+		// 常時接続モードのソケットは維持し、都度接続モードかつFD有効の場合だけ切断する。
+		if ((connect_ == TCP_DISCONNECT) && (tcpInfo_->sd >= 0)) {
+			// 送受信を停止し、ブロッキング中のrecvを解除する。
+			err = shutdown(tcpInfo_->sd, SHUT_RDWR);
+			// shutdown失敗時もCタイムアウトの通知は続けるため、原因のみ記録する。
+			if (err < 0) {
+				// FD番号とOSエラーを記録し、ソケット停止の失敗を明示する。
+				log_printf(LV_ERROR, "shutdown error.(err = %d, errno = %d)\n", err, errno);
+			}
+		}
+		// C待ち呼び出し側が保持するthreadセマフォを解放する。
+		postSemaphore(tcpInfo_->thread_semId);
+		// C完了待ちのタイムアウトを呼び出し元へ通知する。
+		throw ERR_TCPIO_TIMEOUT_C;
+	}
+
+	// セマフォ解放
+	postSemaphore(tcpInfo_->c.semId);
+
+	// 関数実行状態変更
+	setFuncIdSts(tcpInfo_->fid, tcpInfo_->fidNum, E_FuncStsWaitE, id);
+
+	log_printf(LV_DEBUG, "end\n");
+
+	return tcpInfo_->c.rtn;
+}
+
+/**
+ * @brief        終了メッセージ受信
+ * @param[in]    id          関数ID
+ * @param[out]   out         出力データ
+ * @param[in]    size        出力データサイズ
+ * @param[in]    timeout     タイムアウト時間 [usec]
+ *
+ * @retval       なし
+ */
+void ClientTcpIoWithC::waitE(int id, char* out, int size, int timeout)
+{
+	int err = 0; ///< エラー戻り値
+
+	log_printf(LV_DEBUG, "start\n");
+
+	// 関数実行状態チェック
+	// E()完了待ちでないとE()は実行できない
+	if ((getFuncIdSts(tcpInfo_->fid, tcpInfo_->fidNum, id) != E_FuncStsWaitE) &&
+			(getFuncIdSts(tcpInfo_->fid, tcpInfo_->fidNum, id) != E_FuncStsFinE)) {
+		// ただし、同一関数の場合はC()が実行されていなかった場合はwaitC()を呼び処理を継続する
+		if (getFuncIdSts(tcpInfo_->fid, tcpInfo_->fidNum, id) == E_FuncStsWaitC) {
+			log_printf(LV_DEBUG, "not call waitC\n");
+			waitC(id, timeout);
+		}
+		else {
+			log_printf(LV_DEBUG, "funcStatus is wrong.(%d)\n", getFuncIdSts(tcpInfo_->fid, tcpInfo_->fidNum, id));
+			throw ERR_TCPIO_FUNC_STS;
+		}
+	}
+
+	// セマフォ確保
+	err = getSemaphore(tcpInfo_->e.semId, timeout);
+	if (err == -1) {
+		// 指定時間内に終了メッセージ完了セマフォを取得できなかったことを記録する。
+		log_printf(LV_ERROR, "timeout error.(%d)\n", timeout);
+		// ワーカースレッドへタイムアウトを知らせ、受信処理を終了させる。
+		setFuncIdSts(tcpInfo_->fid, tcpInfo_->fidNum, E_FuncStsIdle, id);
+		// 目的: E待ちタイムアウト時にrecvを解除し、ワーカーに都度接続FDを閉じさせる。
+		// 常時接続モードのソケットは維持し、都度接続モードかつFD有効の場合だけ切断する。
+		if ((connect_ == TCP_DISCONNECT) && (tcpInfo_->sd >= 0)) {
+			// 送受信を停止し、ブロッキング中のrecvを解除する。
+			err = shutdown(tcpInfo_->sd, SHUT_RDWR);
+			// shutdown失敗時もEタイムアウトの通知は続けるため、原因のみ記録する。
+			if (err < 0) {
+				// FD番号とOSエラーを記録し、ソケット停止の失敗を明示する。
+				log_printf(LV_ERROR, "shutdown error.(err = %d, errno = %d)\n", err, errno);
+			}
+		}
+		// E待ち呼び出し側が保持するthreadセマフォを解放する。
+		postSemaphore(tcpInfo_->thread_semId);
+		// E完了待ちのタイムアウトを呼び出し元へ通知する。
+		throw ERR_TCPIO_TIMEOUT_E;
+	}
+
+	// セマフォ解放
+	postSemaphore(tcpInfo_->e.semId);
+	postSemaphore(tcpInfo_->thread_semId);
+
+	// 関数実行状態変更
+	setFuncIdSts(tcpInfo_->fid, tcpInfo_->fidNum, E_FuncStsIdle, id);
+
+	// 出力データ受け取り
+	if (tcpInfo_->e.out != NULL) {
+		memcpy(out, tcpInfo_->e.out, size);
+	}
+
+	// 関数戻り値チェック
+	if (tcpInfo_->e.rtn != 0) {
+		throw tcpInfo_->e.rtn;
+	}
+
+	log_printf(LV_DEBUG, "end\n");
+
+	return;
+}
+
+/**
+ * @brief        メッセージチェック
+ * @param[in]    msgType     メッセージタイプ
+ * @param[in]    inFuncId    入力関数ID
+ * @param[in]    inParity1   入力パリティ情報1
+ * @param[in]    inParity2   入力パリティ情報2
+ * @param[in]    outHeader   出力ヘッダ
+ * @param[in]    outFuncId   出力関数ID
+ * @param[in]    outParity1  出力パリティ情報1
+ * @param[in]    outParity2  出力パリティ情報2
+ *
+ * @retval       true        メッセージ一致
+ * @retval       false       メッセージ不一致
+ */
+bool ClientTcpIoWithC::checkMsg(E_MsgTypeWithC msgType, int inFuncId, int inParity1, int inParity2,
+								char* outHeader, int outFuncId, int outParity1, int outParity2)
+{
+	// ヘッダが一致しているか？
+	switch (msgType) {
+	case MSG_TYPE_WITHC_S:
+		if (strcmp(outHeader, "SendHead") != 0) {
+			log_printf(LV_DEBUG, "header no match(SendHead vs %s)\n", outHeader);
+			return false;
+		}
+		break;
+	case MSG_TYPE_WITHC_C:
+		if (strcmp(outHeader, "InfmHead") != 0) {
+			log_printf(LV_DEBUG, "header no match(InfmHead vs %s)\n", outHeader);
+			return false;
+		}
+		break;
+	case MSG_TYPE_WITHC_E:
+		if (strcmp(outHeader, "RecvHead") != 0) {
+			log_printf(LV_DEBUG, "header no match(RecvHead vs %s)\n", outHeader);
+			return false;
+		}
+		break;
+	}
+
+	// 関数IDが一致しているか？
+	if (inFuncId != outFuncId) {
+		log_printf(LV_DEBUG, "funcId no match(%d vs %d)\n", inFuncId, outFuncId);
+		return false;
+	}
+
+	// パリティ情報1が一致しているか？
+	if (inParity1 != outParity1) {
+		log_printf(LV_DEBUG, "parity1 no match(%d vs %d)\n", inParity1, outParity1);
+		return false;
+	}
+
+	// パリティ情報2が一致しているか？
+	if (inParity2 != outParity2) {
+		log_printf(LV_DEBUG, "parity2 no match(%d vs %d)\n", inParity2, outParity2);
+		return false;
+	}
+
+	return true;
+}
+
+/**
+ * @brief        関数実行状態取得
+ * @param[in]    fid         関数ID情報
+ * @param[in]    fidNum      関数ID数
+ * @param[in]    funcId      関数ID
+ *
+ * @retval       関数実行状態(0:Idle状態/1:C完了待ち/2:E完了待ち/3:E完了)
+ */
+E_FuncSts ClientTcpIoWithC::getFuncIdSts(S_TcpFuncId* fid, int fidNum, int funcId)
+{
+	E_FuncSts sts = E_FuncStsIdle;
+
+	for (int i = 0; i < fidNum; i++) {
+		if (funcId == fid[i].funcId) {
+			sts = fid[i].sts;
+		}
+	}
+	return sts;
+}
+
+/**
+ * @brief        関数実行状態設定
+ * @param[inout] fid         関数ID情報
+ * @param[in]    fidNum      関数ID数
+ * @param[in]    sts         関数実行状態(0:Idle状態/1:C完了待ち/2:E完了待ち/3:E完了)
+ * @param[in]    funcId      関数ID
+ *
+ * @retval       なし
+ */
+void ClientTcpIoWithC::setFuncIdSts(S_TcpFuncId* fid, int fidNum, E_FuncSts sts, int funcId)
+{
+	for (int i = 0; i < fidNum; i++) {
+		if (funcId == fid[i].funcId) {
+			fid[i].sts = sts;
+			log_printf(LV_DEBUG, "funcStatus(fid:%d) = %d\n", i + 1, fid[i].sts);
+		}
+	}
+	return;
+}
+
+/**
+ * @brief        関数ID取得
+ * @param[in]    fid         関数ID情報
+ * @param[in]    fidNum      関数ID数
+ *
+ * @retval       関数ID
+ */
+int ClientTcpIoWithC::getFuncId(S_TcpFuncId* fid, int fidNum)
+{
+	int funcId = 0;
+
+	// 実行中の関数は同時には1つしかないことを前提として
+	// 現在実行中の関数IDを取得する
+	for (int i = 0; i < fidNum; i++) {
+		if ((fid[i].sts != E_FuncStsIdle) &&
+				(fid[i].sts != E_FuncStsFinE)) {
+			funcId = fid[i].funcId;
+		}
+	}
+	return funcId;
+}
+
+
+----------------------------------------------------------------------------------------------------
+ClientTcpIo.cpp
+----------------------------------------------------------------------------------------------------
+/**
+ * @file    ClientTcpIo.cpp
+ * @author  Copyright(C) Canon Inc. All right reserved.
+ * @date    2014/01/10
+ * @brief   TCP通信処理
+ * @par     説明
+ *  - TCP通信のクライアント側通信部分の機能を実現するクラス
+ *  - (中間メッセージなし)
+ */
+#include <netdb.h>
+#include <cstring>
+#include "IF_ClientTcpIo.hpp"
+#include "Client.hpp"
+#include "TcpUtil.hpp"
+
+// クライアントが並列で実行した場合、TCP情報は処理中に上書きされてしまうため、
+// staticに保存する期間は最小に抑える必要がある。
+S_TcpInfo* ClientTcpIo::staticTcpInfo_;  ///< TCP情報
+int        ClientTcpIo::semId_ = -1;      ///< スレッド間受け渡しパラメータの保護用セマフォID
+
+/**
+ * @brief        コンストラクタ
+ * @param[in]    tcpInfo     TCP情報
+ * @param[in]    fidNum      関数ID数
+ * @param[in]    host        ホスト名
+ * @param[in]    service     サービス名
+ * @param[in]    connect     接続タイプ(0:常時接続型/1:毎回接続型)
+ */
+ClientTcpIo::ClientTcpIo(S_TcpInfo* tcpInfo, int fidNum, const char* host, const char* service)
+	: UtilDetachThread("TcpSendThread", run), tcpInfo_(tcpInfo), host_(host), service_(service)
+{
+	connect_ = TCP_CONNECT; // connectなしコンストラクタは常時接続型扱い
+	if (tcpInfo_->fid == NULL) {
+		tcpInfo_->fidNum = fidNum;
+		tcpInfo_->fid = new S_TcpFuncId [fidNum];
+		for (int i = 0; i < tcpInfo_->fidNum; i++) {
+			tcpInfo_->fid[i].funcId = i + 1;
+			tcpInfo_->fid[i].sts    = E_FuncStsIdle;
+		}
+	}
+}
+ClientTcpIo::ClientTcpIo(S_TcpInfo* tcpInfo, int fidNum, const char* host, const char* service, int connect)
+	: UtilDetachThread("TcpSendThread", run), tcpInfo_(tcpInfo), host_(host), service_(service), connect_(connect)
+{
+	if (tcpInfo_->fid == NULL) {
+		tcpInfo_->fidNum = fidNum;
+		tcpInfo_->fid = new S_TcpFuncId [fidNum];
+		for (int i = 0; i < tcpInfo_->fidNum; i++) {
+			tcpInfo_->fid[i].funcId = i + 1;
+			tcpInfo_->fid[i].sts    = E_FuncStsIdle;
+		}
+	}
+}
+
+/**
+ * @brief        デストラクタ
+ */
+ClientTcpIo::~ClientTcpIo()
+{
+}
+
+/**
+ * @brief        関数実行
+ * @param[in]    id          関数ID
+ * @param[in]    in          入力データ
+ * @param[in]    size        入力データサイズ
+ * @param[in]    timeout     タイムアウト時間 [usec]
+ *
+ * @retval       なし
+ */
+void ClientTcpIo::exec(int id, char* in, int size, int timeout)
+{
+	int err = 0; ///< エラー戻り値
+
+	log_printf(LV_DEBUG, "start\n");
+
+	// 同一関数の連続実行は許可しない
+	if ((getFuncIdSts(tcpInfo_->fid, tcpInfo_->fidNum, id) != E_FuncStsIdle) &&
+			(getFuncIdSts(tcpInfo_->fid, tcpInfo_->fidNum, id) != E_FuncStsFinE)) {
+		log_printf(LV_DEBUG, "same command can't exec.(%d)\n", id);
+		throw ERR_TCPIO_FUNC_STS;
+	}
+
+	// 初回呼出はセマフォ初期化
+	if (tcpInfo_->thread_semId == -1) {
+		tcpInfo_->thread_semId = initSemaphore(Unlock);
+	}
+	if (tcpInfo_->e.semId == -1) {
+		tcpInfo_->e.semId = initSemaphore(Unlock);
+	}
+
+	// スレッド間受け渡しパラメータを保護するためのセマフォ
+	if (semId_ == -1) {
+		semId_ = initSemaphore(Unlock);
+	}
+
+	// セマフォ確保
+	err = getSemaphore(tcpInfo_->thread_semId, timeout);
+	if (err == -1) {
+		log_printf(LV_ERROR, "timeout error.(%d)\n", timeout);
+		postSemaphore(tcpInfo_->thread_semId);
+		throw ERR_TCPIO_TIMEOUT_S;
+	}
+	err = getSemaphore(tcpInfo_->e.semId, timeout);
+	if (err == -1) {
+		log_printf(LV_ERROR, "timeout error.(%d)\n", timeout);
+		throw ERR_TCPIO_TIMEOUT_S;
+	}
+
+	// 初期化処理(IPアドレス情報、ポート番号情報を取得)
+	Client obj;
+	try {
+		obj.TcpInit(host_, service_, &tcpInfo_->hostInfo, &tcpInfo_->portInfo);
+	} catch (int error) {
+		throw ERR_TCPIO_SYSTEM | error;
+	}
+
+	// 送信メッセージ領域確保
+	// 関数実行毎に確保する
+	if (tcpInfo_->s.in != NULL) {
+		// waitE()で解放が望ましいが、マルチスレッドだと確保～send間で解放されるケースがある
+		delete [] tcpInfo_->s.in;
+		tcpInfo_->s.in = NULL;
+	}
+	int msgSize = SendFixMsgSize + size; // 固定部＋可変部
+	tcpInfo_->s.in = new char [msgSize];
+	if (tcpInfo_->s.in == NULL) {
+		throw ERR_TCPIO_MALLOC;
+	}
+	memset(tcpInfo_->s.in, 0, sizeof(msgSize));
+	log_printf(LV_DEBUG, "msgSize = %d(%d+%d)\n", msgSize, SendFixMsgSize, size);
+
+	// 送信メッセージデータ格納
+	// フォーマットは以下
+	// 8Byte：送信ヘッダ(固定文字列)
+	// 4Byte：関数ID
+	// 8Byte：パリティ情報
+	// 4Byte：データサイズ
+	// 4Byte：中間メッセージ有無情報
+	// 可変 ：送信パラメータ(バイナリ形式)
+	// 8Byte：送信フッタ(固定文字列)
+	struct timeval time;
+	getTime(&time);
+	int n = 7 + size / sizeof(int); // 送信フッタインデックス
+	int* ptr = reinterpret_cast<int*>(tcpInfo_->s.in);
+	memcpy(ptr, "SendHead", 2 * sizeof(int));   // 送信ヘッダ("SendHead")
+	*(ptr + 2) = htonl(id);                     // 関数ID
+	*(ptr + 3) = htonl((int)time.tv_sec);       // パリティ情報1(現在時刻sec部分)
+	*(ptr + 4) = htonl((int)time.tv_usec);      // パリティ情報2(現在時刻usec部分)
+	*(ptr + 5) = htonl(size);                   // データサイズ
+	*(ptr + 6) = htonl(0);                      // 中間メッセージ有無情報(なし)
+	memcpy(ptr + 7, in, size);                  // 送信パラメータ
+	memcpy(ptr + n, "SendFoot", 2 * sizeof(int)); // 送信フッタ("SendFoot")
+	tcpInfo_->s.size  = msgSize;                // 送信メッセージサイズ
+
+	// データ保存
+	setFuncIdSts(tcpInfo_->fid, tcpInfo_->fidNum, E_FuncStsWaitE, id); // E完了待ち
+	tcpInfo_->parity1 = (int)time.tv_sec;  // パリティ情報1
+	tcpInfo_->parity2 = (int)time.tv_usec; // パリティ情報2
+	tcpInfo_->connect = connect_;          // 接続タイプ(0:常時接続型/1:毎回接続型)
+	log_printf(LV_DEBUG, "parity1=%d, parity2=%d\n", tcpInfo_->parity1, tcpInfo_->parity2);
+
+	// TCP情報をstaticに保持する。
+	// クライアントが並列で実行した場合、TCP情報は処理中に上書きされてしまうため、
+	// スレッド処理開始直後にauto変数に退避する。
+	// 受け渡しが終るまでセマフォで保護する。
+	err = getSemaphore(semId_, timeout);
+	if (err == -1) {
+		log_printf(LV_ERROR, "timeout error.(%d)\n", timeout);
+		throw ERR_TCPIO_TIMEOUT_S;
+	}
+	staticTcpInfo_ = tcpInfo_;
+
+	// スレッド処理開始。run()を別スレッドで実行する。
+	start();
+
+	log_printf(LV_DEBUG, "end\n");
+
+	return;
+}
+
+/**
+ * @brief        スレッドで実行する処理
+ *               スレッド処理が並列で動作することはない
+ *
+ * @retval       なし
+ */
+void ClientTcpIo::run()
+{
+	const int RETRY_MAX = 30;        ///< メッセージ受信リトライ最大回数
+	int       retry = 0;             ///< リトライループカウンタ
+	char      header[HEADER_SIZE + 1]; ///< ヘッダ(固定文字列)
+	int       funcId  = 0;           ///<  関数ID
+	int       l_fid   = 0;           ///<  関数ID
+	int       parity1 = 0;           ///<  パリティ情報1
+	int       parity2 = 0;           ///<  パリティ情報2
+	Client*    client = NULL;        ///< クライアントクラス
+	bool      e_sem   = false;       ///< e.semId解放確認
+	bool      th_sem  = false;       ///< thread_semId解放確認
+
+	log_printf(LV_DEBUG, "start\n");
+
+	// static情報をauto変数に退避。
+	// TCP情報が格納されている領域は、呼び出し元でstaticに確保している前提。
+	S_TcpInfo* tcpInfo = staticTcpInfo_;
+	l_fid = getFuncId(tcpInfo->fid, tcpInfo->fidNum);
+
+	// 退避中はセマフォで保護
+	postSemaphore(semId_);
+
+	try {
+		client = new Client(tcpInfo->hostInfo, tcpInfo->portInfo);
+
+		try {
+			// サーバ接続
+			client->TcpConnect(&tcpInfo->sd, tcpInfo->connect);
+		} catch (int error) {
+			throw ERR_TCPIO_CONNECT | error;
+		}
+
+		try {
+			// サーバに送信メッセージ送信
+			client->TcpWrite(tcpInfo->sd, tcpInfo->s.size, tcpInfo->s.in);
+		} catch (int error) {
+			throw ERR_TCPIO_SEND | error;
+		}
+
+		// 返信メッセージ受信
+		for (retry = 0; retry < RETRY_MAX; retry++) {
+
+			try {
+				// サーバから1メッセージ読み込み、送信メッセージに対する返信メッセージかをチェック
+				memset(header, 0, sizeof(header));
+				client->TcpRead(tcpInfo->sd, &tcpInfo->e.size, &tcpInfo->e.out, &tcpInfo->e.rtn,
+								header, &funcId, &parity1, &parity2);
+			} catch (int error) {
+				throw ERR_TCPIO_RECEIVE | error;
+			}
+			if (checkMsg(MSG_TYPE_E, l_fid, tcpInfo->parity1, tcpInfo->parity2,
+						 header, funcId, parity1, parity2) == true) {
+				break;
+			}
+
+			// 本スレッドがタイムアウト等で終了している場合は速やかに終了する
+			if (getFuncIdSts(tcpInfo->fid, tcpInfo->fidNum, l_fid) == E_FuncStsIdle) {
+				log_printf(LV_DEBUG, "this function must not continue.\n");
+				throw ERR_TCPIO_FUNC_STS;
+			}
+
+			// 規定回数メッセージを読み込んでも該当しない場合はエラーとする
+			if (retry == RETRY_MAX - 1) {
+				log_printf(LV_ERROR, "receive retry max error.(%d)\n", retry);
+				throw ERR_TCPIO_RECEIVE;
+			}
+		}
+
+		// 関数の戻り値チェック
+		if (tcpInfo->e.rtn != 0) {
+			log_printf(LV_ERROR, "exec function rtn error.(%d)\n", tcpInfo->e.rtn);
+			throw tcpInfo->e.rtn;
+		}
+
+		// 関数終了
+		setFuncIdSts(tcpInfo->fid, tcpInfo->fidNum, E_FuncStsFinE, l_fid); // E完了
+
+		// サーバ切断
+		client->TcpClose(&tcpInfo->sd, tcpInfo->connect);
+
+		// セマフォ解放
+		postSemaphore(tcpInfo->e.semId);
+		e_sem  = true;
+		th_sem = true;
+
+		delete client;
+	}
+	catch (int error) {
+		log_printf(LV_ERROR, "error.(0x%x)\n", error);
+		setFuncIdSts(tcpInfo->fid, tcpInfo->fidNum, E_FuncStsFinE, l_fid);
+		client->TcpClose(&tcpInfo->sd, TCP_DISCONNECT);
+		tcpInfo->e.rtn = error;
+		if (!e_sem)  postSemaphore(tcpInfo->e.semId);
+		if (!th_sem) postSemaphore(tcpInfo->thread_semId);
+		delete client;
+		throw error;
+	}
+	catch (...) {
+		log_printf(LV_ERROR, "error.\n");
+		setFuncIdSts(tcpInfo->fid, tcpInfo->fidNum, E_FuncStsFinE, l_fid);
+		client->TcpClose(&tcpInfo->sd, TCP_DISCONNECT);
+		tcpInfo->e.rtn = -1;
+		if (!e_sem)  postSemaphore(tcpInfo->e.semId);
+		if (!th_sem) postSemaphore(tcpInfo->thread_semId);
+		delete client;
+		throw - 1;
+	}
+
+	log_printf(LV_DEBUG, "end\n");
+
+	return;
+}
+
+/**
+ * @brief        終了メッセージ受信
+ * @param[in]    id          関数ID
+ * @param[out]   out         出力データ
+ * @param[in]    size        出力データサイズ
+ * @param[in]    timeout     タイムアウト時間 [usec]
+ *
+ * @retval       なし
+ */
+void ClientTcpIo::waitE(int id, char* out, int size, int timeout)
+{
+	int err = 0; ///< エラー戻り値
+
+	log_printf(LV_DEBUG, "start\n");
+
+	// 関数実行状態チェック
+	// E()完了待ちでないとE()は実行できない
+	if ((getFuncIdSts(tcpInfo_->fid, tcpInfo_->fidNum, id) != E_FuncStsWaitE) &&
+			(getFuncIdSts(tcpInfo_->fid, tcpInfo_->fidNum, id) != E_FuncStsFinE)) {
+		log_printf(LV_DEBUG, "funcStatus is wrong.(%d)\n", getFuncIdSts(tcpInfo_->fid, tcpInfo_->fidNum, id));
+		throw ERR_TCPIO_FUNC_STS;
+	}
+
+	// セマフォ確保
+	err = getSemaphore(tcpInfo_->e.semId, timeout);
+	if (err == -1) {
+		log_printf(LV_ERROR, "timeout error.(%d)\n", timeout);
+		setFuncIdSts(tcpInfo_->fid, tcpInfo_->fidNum, E_FuncStsIdle, id);
+		postSemaphore(tcpInfo_->thread_semId);
+		throw ERR_TCPIO_TIMEOUT_E;
+	}
+
+	// セマフォ解放
+	postSemaphore(tcpInfo_->e.semId);
+	postSemaphore(tcpInfo_->thread_semId);
+
+	// 関数実行状態変更
+	setFuncIdSts(tcpInfo_->fid, tcpInfo_->fidNum, E_FuncStsIdle, id);
+
+	// 出力データ受け取り
+	if (tcpInfo_->e.out != NULL) {
+		memcpy(out, tcpInfo_->e.out, size);
+	}
+
+	// 関数戻り値チェック
+	if (tcpInfo_->e.rtn != 0) {
+		throw tcpInfo_->e.rtn;
+	}
+
+	log_printf(LV_DEBUG, "end\n");
+
+	return;
+}
+
+/**
+ * @brief        メッセージチェック
+ * @param[in]    msgType     メッセージタイプ
+ * @param[in]    inFuncId    入力関数ID
+ * @param[in]    inParity1   入力パリティ情報1
+ * @param[in]    inParity2   入力パリティ情報2
+ * @param[in]    outHeader   出力ヘッダ
+ * @param[in]    outFuncId   出力関数ID
+ * @param[in]    outParity1  出力パリティ情報1
+ * @param[in]    outParity2  出力パリティ情報2
+ *
+ * @retval       true        メッセージ一致
+ * @retval       false       メッセージ不一致
+ */
+bool ClientTcpIo::checkMsg(E_MsgType msgType, int inFuncId, int inParity1, int inParity2,
+						   char* outHeader, int outFuncId, int outParity1, int outParity2)
+{
+	// ヘッダが一致しているか？
+	switch (msgType) {
+	case MSG_TYPE_S:
+		if (strcmp(outHeader, "SendHead") != 0) {
+			log_printf(LV_DEBUG, "header no match(SendHead vs %s)\n", outHeader);
+			return false;
+		}
+		break;
+	case MSG_TYPE_E:
+		if (strcmp(outHeader, "RecvHead") != 0) {
+			log_printf(LV_DEBUG, "header no match(RecvHead vs %s)\n", outHeader);
+			return false;
+		}
+		break;
+	}
+
+	// 関数IDが一致しているか？
+	if (inFuncId != outFuncId) {
+		log_printf(LV_DEBUG, "funcId no match(%d vs %d)\n", inFuncId, outFuncId);
+		return false;
+	}
+
+	// パリティ情報1が一致しているか？
+	if (inParity1 != outParity1) {
+		log_printf(LV_DEBUG, "parity1 no match(%d vs %d)\n", inParity1, outParity1);
+		return false;
+	}
+
+	// パリティ情報2が一致しているか？
+	if (inParity2 != outParity2) {
+		log_printf(LV_DEBUG, "parity2 no match(%d vs %d)\n", inParity2, outParity2);
+		return false;
+	}
+
+	return true;
+}
+
+/**
+ * @brief        関数実行状態取得
+ * @param[in]    fid         関数ID情報
+ * @param[in]    fidNum      関数ID数
+ * @param[in]    funcId      関数ID
+ *
+ * @retval       関数実行状態(0:Idle状態/1:C完了待ち/2:E完了待ち/3:E完了)
+ */
+E_FuncSts ClientTcpIo::getFuncIdSts(S_TcpFuncId* fid, int fidNum, int funcId)
+{
+	E_FuncSts sts = E_FuncStsIdle;
+
+	for (int i = 0; i < fidNum; i++) {
+		if (funcId == fid[i].funcId) {
+			sts = fid[i].sts;
+		}
+	}
+	return sts;
+}
+
+/**
+ * @brief        関数実行状態設定
+ * @param[inout] fid         関数ID情報
+ * @param[in]    fidNum      関数ID数
+ * @param[in]    sts         関数実行状態(0:Idle状態/1:C完了待ち/2:E完了待ち/3:E完了)
+ * @param[in]    funcId      関数ID
+ *
+ * @retval       なし
+ */
+void ClientTcpIo::setFuncIdSts(S_TcpFuncId* fid, int fidNum, E_FuncSts sts, int funcId)
+{
+	for (int i = 0; i < fidNum; i++) {
+		if (funcId == fid[i].funcId) {
+			fid[i].sts = sts;
+			log_printf(LV_DEBUG, "funcStatus(fid:%d) = %d\n", i + 1, fid[i].sts);
+		}
+	}
+	return;
+}
+
+/**
+ * @brief        関数ID取得
+ * @param[in]    fid         関数ID情報
+ * @param[in]    fidNum      関数ID数
+ *
+ * @retval       関数ID
+ */
+int ClientTcpIo::getFuncId(S_TcpFuncId* fid, int fidNum)
+{
+	int funcId = 0;
+
+	// 実行中の関数は同時には1つしかないことを前提として
+	// 現在実行中の関数IDを取得する
+	for (int i = 0; i < fidNum; i++) {
+		if ((fid[i].sts != E_FuncStsIdle) &&
+				(fid[i].sts != E_FuncStsFinE)) {
+			funcId = fid[i].funcId;
+		}
+	}
+	return funcId;
+}
+
+
+----------------------------------------------------------------------------------------------------
+/**
+ * @file    ClientTcpIo.cpp
+ * @author  Copyright(C) Canon Inc. All right reserved.
+ * @date    2014/01/10
+ * @brief   TCP通信処理
+ * @par     説明
+ *  - TCP通信のクライアント側通信部分の機能を実現するクラス
+ *  - (中間メッセージなし)
+ */
+#include <netdb.h>
+#include <cstring>
+#include "IF_ClientTcpIo.hpp"
+#include "Client.hpp"
+#include "TcpUtil.hpp"
+
+// クライアントが並列で実行した場合、TCP情報は処理中に上書きされてしまうため、
+// staticに保存する期間は最小に抑える必要がある。
+S_TcpInfo* ClientTcpIo::staticTcpInfo_;  ///< TCP情報
+int        ClientTcpIo::semId_ = -1;      ///< スレッド間受け渡しパラメータの保護用セマフォID
+
+/**
+ * @brief        コンストラクタ
+ * @param[in]    tcpInfo     TCP情報
+ * @param[in]    fidNum      関数ID数
+ * @param[in]    host        ホスト名
+ * @param[in]    service     サービス名
+ * @param[in]    connect     接続タイプ(0:常時接続型/1:毎回接続型)
+ */
+ClientTcpIo::ClientTcpIo(S_TcpInfo* tcpInfo, int fidNum, const char* host, const char* service)
+	: UtilDetachThread("TcpSendThread", run), tcpInfo_(tcpInfo), host_(host), service_(service)
+{
+	connect_ = TCP_CONNECT; // connectなしコンストラクタは常時接続型扱い
+	if (tcpInfo_->fid == NULL) {
+		tcpInfo_->fidNum = fidNum;
+		tcpInfo_->fid = new S_TcpFuncId [fidNum];
+		for (int i = 0; i < tcpInfo_->fidNum; i++) {
+			tcpInfo_->fid[i].funcId = i + 1;
+			tcpInfo_->fid[i].sts    = E_FuncStsIdle;
+		}
+	}
+}
+ClientTcpIo::ClientTcpIo(S_TcpInfo* tcpInfo, int fidNum, const char* host, const char* service, int connect)
+	: UtilDetachThread("TcpSendThread", run), tcpInfo_(tcpInfo), host_(host), service_(service), connect_(connect)
+{
+	if (tcpInfo_->fid == NULL) {
+		tcpInfo_->fidNum = fidNum;
+		tcpInfo_->fid = new S_TcpFuncId [fidNum];
+		for (int i = 0; i < tcpInfo_->fidNum; i++) {
+			tcpInfo_->fid[i].funcId = i + 1;
+			tcpInfo_->fid[i].sts    = E_FuncStsIdle;
+		}
+	}
+}
+
+/**
+ * @brief        デストラクタ
+ */
+ClientTcpIo::~ClientTcpIo()
+{
+}
+
+/**
+ * @brief        関数実行
+ * @param[in]    id          関数ID
+ * @param[in]    in          入力データ
+ * @param[in]    size        入力データサイズ
+ * @param[in]    timeout     タイムアウト時間 [usec]
+ *
+ * @retval       なし
+ */
+void ClientTcpIo::exec(int id, char* in, int size, int timeout)
+{
+	int err = 0; ///< エラー戻り値
+
+	log_printf(LV_DEBUG, "start\n");
+
+	// 同一関数の連続実行は許可しない
+	if ((getFuncIdSts(tcpInfo_->fid, tcpInfo_->fidNum, id) != E_FuncStsIdle) &&
+			(getFuncIdSts(tcpInfo_->fid, tcpInfo_->fidNum, id) != E_FuncStsFinE)) {
+		log_printf(LV_DEBUG, "same command can't exec.(%d)\n", id);
+		throw ERR_TCPIO_FUNC_STS;
+	}
+
+	// 初回呼出はセマフォ初期化
+	if (tcpInfo_->thread_semId == -1) {
+		tcpInfo_->thread_semId = initSemaphore(Unlock);
+	}
+	if (tcpInfo_->e.semId == -1) {
+		tcpInfo_->e.semId = initSemaphore(Unlock);
+	}
+
+	// スレッド間受け渡しパラメータを保護するためのセマフォ
+	if (semId_ == -1) {
+		semId_ = initSemaphore(Unlock);
+	}
+
+	// セマフォ確保
+	err = getSemaphore(tcpInfo_->thread_semId, timeout);
+	if (err == -1) {
+		log_printf(LV_ERROR, "timeout error.(%d)\n", timeout);
+		postSemaphore(tcpInfo_->thread_semId);
+		throw ERR_TCPIO_TIMEOUT_S;
+	}
+	err = getSemaphore(tcpInfo_->e.semId, timeout);
+	if (err == -1) {
+		log_printf(LV_ERROR, "timeout error.(%d)\n", timeout);
+		throw ERR_TCPIO_TIMEOUT_S;
+	}
+
+	// 初期化処理(IPアドレス情報、ポート番号情報を取得)
+	Client obj;
+	try {
+		obj.TcpInit(host_, service_, &tcpInfo_->hostInfo, &tcpInfo_->portInfo);
+	} catch (int error) {
+		throw ERR_TCPIO_SYSTEM | error;
+	}
+
+	// 送信メッセージ領域確保
+	// 関数実行毎に確保する
+	if (tcpInfo_->s.in != NULL) {
+		// waitE()で解放が望ましいが、マルチスレッドだと確保〜send間で解放されるケースがある
+		delete [] tcpInfo_->s.in;
+		tcpInfo_->s.in = NULL;
+	}
+	int msgSize = SendFixMsgSize + size; // 固定部＋可変部
+	tcpInfo_->s.in = new char [msgSize];
+	if (tcpInfo_->s.in == NULL) {
+		throw ERR_TCPIO_MALLOC;
+	}
+	memset(tcpInfo_->s.in, 0, sizeof(msgSize));
+	log_printf(LV_DEBUG, "msgSize = %d(%d+%d)\n", msgSize, SendFixMsgSize, size);
+
+	// 送信メッセージデータ格納
+	// フォーマットは以下
+	// 8Byte：送信ヘッダ(固定文字列)
+	// 4Byte：関数ID
+	// 8Byte：パリティ情報
+	// 4Byte：データサイズ
+	// 4Byte：中間メッセージ有無情報
+	// 可変 ：送信パラメータ(バイナリ形式)
+	// 8Byte：送信フッタ(固定文字列)
+	struct timeval time;
+	getTime(&time);
+	int n = 7 + size / sizeof(int); // 送信フッタインデックス
+	int* ptr = reinterpret_cast<int*>(tcpInfo_->s.in);
+	memcpy(ptr, "SendHead", 2 * sizeof(int));   // 送信ヘッダ("SendHead")
+	*(ptr + 2) = htonl(id);                     // 関数ID
+	*(ptr + 3) = htonl((int)time.tv_sec);       // パリティ情報1(現在時刻sec部分)
+	*(ptr + 4) = htonl((int)time.tv_usec);      // パリティ情報2(現在時刻usec部分)
+	*(ptr + 5) = htonl(size);                   // データサイズ
+	*(ptr + 6) = htonl(0);                      // 中間メッセージ有無情報(なし)
+	memcpy(ptr + 7, in, size);                  // 送信パラメータ
+	memcpy(ptr + n, "SendFoot", 2 * sizeof(int)); // 送信フッタ("SendFoot")
+	tcpInfo_->s.size  = msgSize;                // 送信メッセージサイズ
+
+	// データ保存
+	setFuncIdSts(tcpInfo_->fid, tcpInfo_->fidNum, E_FuncStsWaitE, id); // E完了待ち
+	tcpInfo_->parity1 = (int)time.tv_sec;  // パリティ情報1
+	tcpInfo_->parity2 = (int)time.tv_usec; // パリティ情報2
+	tcpInfo_->connect = connect_;          // 接続タイプ(0:常時接続型/1:毎回接続型)
+	log_printf(LV_DEBUG, "parity1=%d, parity2=%d\n", tcpInfo_->parity1, tcpInfo_->parity2);
+
+	// TCP情報をstaticに保持する。
+	// クライアントが並列で実行した場合、TCP情報は処理中に上書きされてしまうため、
+	// スレッド処理開始直後にauto変数に退避する。
+	// 受け渡しが終るまでセマフォで保護する。
+	err = getSemaphore(semId_, timeout);
+	if (err == -1) {
+		log_printf(LV_ERROR, "timeout error.(%d)\n", timeout);
+		throw ERR_TCPIO_TIMEOUT_S;
+	}
+	staticTcpInfo_ = tcpInfo_;
+
+	// スレッド処理開始。run()を別スレッドで実行する。
+	start();
+
+	log_printf(LV_DEBUG, "end\n");
+
+	return;
+}
+
+/**
+ * @brief        スレッドで実行する処理
+ *               スレッド処理が並列で動作することはない
+ *
+ * @retval       なし
+ */
+void ClientTcpIo::run()
+{
+	const int RETRY_MAX = 30;        ///< メッセージ受信リトライ最大回数
+	int       retry = 0;             ///< リトライループカウンタ
+	char      header[HEADER_SIZE + 1]; ///< ヘッダ(固定文字列)
+	int       funcId  = 0;           ///<  関数ID
+	int       l_fid   = 0;           ///<  関数ID
+	int       parity1 = 0;           ///<  パリティ情報1
+	int       parity2 = 0;           ///<  パリティ情報2
+	Client*    client = NULL;        ///< クライアントクラス
+	bool      e_sem   = false;       ///< e.semId解放確認
+	bool      th_sem  = false;       ///< thread_semId解放確認
+
+	log_printf(LV_DEBUG, "start\n");
+
+	// static情報をauto変数に退避。
+	// TCP情報が格納されている領域は、呼び出し元でstaticに確保している前提。
+	S_TcpInfo* tcpInfo = staticTcpInfo_;
+	l_fid = getFuncId(tcpInfo->fid, tcpInfo->fidNum);
+
+	// 退避中はセマフォで保護
+	postSemaphore(semId_);
+
+	try {
+		client = new Client(tcpInfo->hostInfo, tcpInfo->portInfo);
+
+		try {
+			// サーバ接続
+			client->TcpConnect(&tcpInfo->sd, tcpInfo->connect);
+		} catch (int error) {
+			throw ERR_TCPIO_CONNECT | error;
+		}
+
+		// 目的: 接続待ち中に呼び出し元がタイムアウトした場合、接続成功後の不要な送受信を防ぐ。
+		// 処理: 都度接続モードに限り、関数状態がIdleならタイムアウト済みとして例外経路へ移す。
+		if ((tcpInfo->connect == TCP_DISCONNECT) &&
+				// 呼び出し側が待機を打ち切った状態か確認する。
+				(getFuncIdSts(tcpInfo->fid, tcpInfo->fidNum, l_fid) == E_FuncStsIdle)) {
+			// 共通の例外処理にFDのクローズとセマフォ後始末を任せる。
+			throw ERR_TCPIO_FUNC_STS;
+		}
+
+		try {
+			// サーバに送信メッセージ送信
+			client->TcpWrite(tcpInfo->sd, tcpInfo->s.size, tcpInfo->s.in);
+		} catch (int error) {
+			throw ERR_TCPIO_SEND | error;
+		}
+
+		// 目的: 送信中に呼び出し元がタイムアウトした場合、応答受信待ちへ進まないようにする。
+		// 処理: 都度接続モードでIdleを検出したら、例外経路で使用中のソケットを閉じる。
+		if ((tcpInfo->connect == TCP_DISCONNECT) &&
+				// 接続中に呼び出し側がタイムアウト状態へ変更したか確認する。
+				(getFuncIdSts(tcpInfo->fid, tcpInfo->fidNum, l_fid) == E_FuncStsIdle)) {
+			// 送受信を打ち切り、共通のクローズ処理へ移る。
+			throw ERR_TCPIO_FUNC_STS;
+		}
+
+		// 返信メッセージ受信
+		for (retry = 0; retry < RETRY_MAX; retry++) {
+
+			try {
+				// サーバから1メッセージ読み込み、送信メッセージに対する返信メッセージかをチェック
+				memset(header, 0, sizeof(header));
+				client->TcpRead(tcpInfo->sd, &tcpInfo->e.size, &tcpInfo->e.out, &tcpInfo->e.rtn,
+								header, &funcId, &parity1, &parity2);
+			} catch (int error) {
+				throw ERR_TCPIO_RECEIVE | error;
+			}
+			if (checkMsg(MSG_TYPE_E, l_fid, tcpInfo->parity1, tcpInfo->parity2,
+						 header, funcId, parity1, parity2) == true) {
+				break;
+			}
+
+			// 本スレッドがタイムアウト等で終了している場合は速やかに終了する
+			if (getFuncIdSts(tcpInfo->fid, tcpInfo->fidNum, l_fid) == E_FuncStsIdle) {
+				log_printf(LV_DEBUG, "this function must not continue.\n");
+				throw ERR_TCPIO_FUNC_STS;
+			}
+
+			// 規定回数メッセージを読み込んでも該当しない場合はエラーとする
+			if (retry == RETRY_MAX - 1) {
+				log_printf(LV_ERROR, "receive retry max error.(%d)\n", retry);
+				throw ERR_TCPIO_RECEIVE;
+			}
+		}
+
+		// 関数の戻り値チェック
+		if (tcpInfo->e.rtn != 0) {
+			log_printf(LV_ERROR, "exec function rtn error.(%d)\n", tcpInfo->e.rtn);
+			throw tcpInfo->e.rtn;
+		}
+
+		// 関数終了
+		setFuncIdSts(tcpInfo->fid, tcpInfo->fidNum, E_FuncStsFinE, l_fid); // E完了
+
+		// サーバ切断
+		client->TcpClose(&tcpInfo->sd, tcpInfo->connect);
+
+		// セマフォ解放
+		postSemaphore(tcpInfo->e.semId);
+		e_sem  = true;
+		th_sem = true;
+
+		delete client;
+	}
+	catch (int error) {
+		// 整数エラーの発生を記録し、接続・送受信で確保した資源を解放する。
+		log_printf(LV_ERROR, "error.(0x%x)\n", error);
+		// 目的: タイムアウト側とワーカースレッド側の二重解放やFDリークを防止する。
+		// 現在IdleならwaitE側がすでにタイムアウト処理を始めていることを記録する。
+		bool callerTimedOut = (getFuncIdSts(tcpInfo->fid, tcpInfo->fidNum, l_fid) == E_FuncStsIdle);
+		// 呼び出し元へエラー完了を知らせるため、関数状態を完了状態へ更新する。
+		setFuncIdSts(tcpInfo->fid, tcpInfo->fidNum, E_FuncStsFinE, l_fid);
+		// clientとFDの両方が有効な場合に限り、都度接続したソケットを閉じる。
+		if ((client != NULL) && (tcpInfo->sd >= 0)) {
+			// TCP_DISCONNECTを指定してshutdown/closeし、共有FDも無効化する。
+			client->TcpClose(&tcpInfo->sd, TCP_DISCONNECT);
+		}
+		// waitEへ今回の整数エラーを返すため、結果領域に保存する。
+		tcpInfo->e.rtn = error;
+		// E完了セマフォをまだ通知していない場合にだけ、待ち側へ通知する。
+		if (!e_sem)  postSemaphore(tcpInfo->e.semId);
+		// タイムアウト側がすでにthreadセマフォを解放していない場合に限り、ここで解放する。
+		if (!th_sem && !callerTimedOut) postSemaphore(tcpInfo->thread_semId);
+		// ワーカースレッドが作成したClientオブジェクトを破棄する。
+		delete client;
+		// 元の整数エラーを維持して上位へ通知する。
+		throw error;
+	}
+	catch (...) {
+		// 整数以外の例外も記録し、同じ資源解放経路で安全に後始末する。
+		log_printf(LV_ERROR, "error.\n");
+		// 目的: 想定外の例外でもFDリークとセマフォ二重解放を防止する。
+		// 現在IdleならwaitE側がタイムアウト処理中なので、その状態を保持する。
+		bool callerTimedOut = (getFuncIdSts(tcpInfo->fid, tcpInfo->fidNum, l_fid) == E_FuncStsIdle);
+		// 呼び出し元に処理終了を知らせるため、関数状態を完了状態へ更新する。
+		setFuncIdSts(tcpInfo->fid, tcpInfo->fidNum, E_FuncStsFinE, l_fid);
+		// clientとFDが有効な場合だけ、都度接続したソケットを閉じる。
+		if ((client != NULL) && (tcpInfo->sd >= 0)) {
+			// TCP_DISCONNECTを指定してソケットを閉じ、共有FDを無効化する。
+			client->TcpClose(&tcpInfo->sd, TCP_DISCONNECT);
+		}
+		// 汎用エラーを呼び出し元へ返すため、結果領域に保存する。
+		tcpInfo->e.rtn = -1;
+		// E完了セマフォが未通知の場合だけ、待ち側へ通知する。
+		if (!e_sem)  postSemaphore(tcpInfo->e.semId);
+		// タイムアウト側がthreadセマフォを解放済みなら、二重解放しない。
+		if (!th_sem && !callerTimedOut) postSemaphore(tcpInfo->thread_semId);
+		// ワーカースレッドが作成したClientオブジェクトを破棄する。
+		delete client;
+		// 想定外の例外を既存の汎用エラー値へ変換して上位へ返す。
+		throw - 1;
+	}
+
+	log_printf(LV_DEBUG, "end\n");
+
+	return;
+}
+
+/**
+ * @brief        終了メッセージ受信
+ * @param[in]    id          関数ID
+ * @param[out]   out         出力データ
+ * @param[in]    size        出力データサイズ
+ * @param[in]    timeout     タイムアウト時間 [usec]
+ *
+ * @retval       なし
+ */
+void ClientTcpIo::waitE(int id, char* out, int size, int timeout)
+{
+	int err = 0; ///< エラー戻り値
+
+	log_printf(LV_DEBUG, "start\n");
+
+	// 関数実行状態チェック
+	// E()完了待ちでないとE()は実行できない
+	if ((getFuncIdSts(tcpInfo_->fid, tcpInfo_->fidNum, id) != E_FuncStsWaitE) &&
+			(getFuncIdSts(tcpInfo_->fid, tcpInfo_->fidNum, id) != E_FuncStsFinE)) {
+		log_printf(LV_DEBUG, "funcStatus is wrong.(%d)\n", getFuncIdSts(tcpInfo_->fid, tcpInfo_->fidNum, id));
+		throw ERR_TCPIO_FUNC_STS;
+	}
+
+	// セマフォ確保
+	err = getSemaphore(tcpInfo_->e.semId, timeout);
+	if (err == -1) {
+		// 指定時間内にE完了セマフォを取得できなかったことを記録する。
+		log_printf(LV_ERROR, "timeout error.(%d)\n", timeout);
+		// ワーカースレッドにタイムアウトを知らせ、受信ループを終了させる。
+		setFuncIdSts(tcpInfo_->fid, tcpInfo_->fidNum, E_FuncStsIdle, id);
+		// 目的: E待ちタイムアウト後にブロッキングrecvを解除し、ワーカーによるFDクローズを促す。
+		// 常時接続ソケットは閉じず、都度接続モードで有効なFDがある場合だけ対象とする。
+		if ((connect_ == TCP_DISCONNECT) && (tcpInfo_->sd >= 0)) {
+			// ソケットの送受信を停止して、ワーカースレッドのブロッキングI/Oを解除する。
+			err = shutdown(tcpInfo_->sd, SHUT_RDWR);
+			// shutdown失敗を記録するが、タイムアウト通知と後続処理は続行する。
+			if (err < 0) {
+				// FD番号とOSエラー番号をログに残し、解除失敗を見えるようにする。
+				log_printf(LV_ERROR, "shutdown error.(err = %d, errno = %d)\n", err, errno);
+			}
+		}
+		// 呼び出し側が保持しているthreadセマフォを解放する。
+		postSemaphore(tcpInfo_->thread_semId);
+		// E待ちタイムアウトを呼び出し側へ通知する。
+		throw ERR_TCPIO_TIMEOUT_E;
+	}
+
+	// セマフォ解放
+	postSemaphore(tcpInfo_->e.semId);
+	postSemaphore(tcpInfo_->thread_semId);
+
+	// 関数実行状態変更
+	setFuncIdSts(tcpInfo_->fid, tcpInfo_->fidNum, E_FuncStsIdle, id);
+
+	// 出力データ受け取り
+	if (tcpInfo_->e.out != NULL) {
+		memcpy(out, tcpInfo_->e.out, size);
+	}
+
+	// 関数戻り値チェック
+	if (tcpInfo_->e.rtn != 0) {
+		throw tcpInfo_->e.rtn;
+	}
+
+	log_printf(LV_DEBUG, "end\n");
+
+	return;
+}
+
+/**
+ * @brief        メッセージチェック
+ * @param[in]    msgType     メッセージタイプ
+ * @param[in]    inFuncId    入力関数ID
+ * @param[in]    inParity1   入力パリティ情報1
+ * @param[in]    inParity2   入力パリティ情報2
+ * @param[in]    outHeader   出力ヘッダ
+ * @param[in]    outFuncId   出力関数ID
+ * @param[in]    outParity1  出力パリティ情報1
+ * @param[in]    outParity2  出力パリティ情報2
+ *
+ * @retval       true        メッセージ一致
+ * @retval       false       メッセージ不一致
+ */
+bool ClientTcpIo::checkMsg(E_MsgType msgType, int inFuncId, int inParity1, int inParity2,
+						   char* outHeader, int outFuncId, int outParity1, int outParity2)
+{
+	// ヘッダが一致しているか？
+	switch (msgType) {
+	case MSG_TYPE_S:
+		if (strcmp(outHeader, "SendHead") != 0) {
+			log_printf(LV_DEBUG, "header no match(SendHead vs %s)\n", outHeader);
+			return false;
+		}
+		break;
+	case MSG_TYPE_E:
+		if (strcmp(outHeader, "RecvHead") != 0) {
+			log_printf(LV_DEBUG, "header no match(RecvHead vs %s)\n", outHeader);
+			return false;
+		}
+		break;
+	}
+
+	// 関数IDが一致しているか？
+	if (inFuncId != outFuncId) {
+		log_printf(LV_DEBUG, "funcId no match(%d vs %d)\n", inFuncId, outFuncId);
+		return false;
+	}
+
+	// パリティ情報1が一致しているか？
+	if (inParity1 != outParity1) {
+		log_printf(LV_DEBUG, "parity1 no match(%d vs %d)\n", inParity1, outParity1);
+		return false;
+	}
+
+	// パリティ情報2が一致しているか？
+	if (inParity2 != outParity2) {
+		log_printf(LV_DEBUG, "parity2 no match(%d vs %d)\n", inParity2, outParity2);
+		return false;
+	}
+
+	return true;
+}
+
+/**
+ * @brief        関数実行状態取得
+ * @param[in]    fid         関数ID情報
+ * @param[in]    fidNum      関数ID数
+ * @param[in]    funcId      関数ID
+ *
+ * @retval       関数実行状態(0:Idle状態/1:C完了待ち/2:E完了待ち/3:E完了)
+ */
+E_FuncSts ClientTcpIo::getFuncIdSts(S_TcpFuncId* fid, int fidNum, int funcId)
+{
+	E_FuncSts sts = E_FuncStsIdle;
+
+	for (int i = 0; i < fidNum; i++) {
+		if (funcId == fid[i].funcId) {
+			sts = fid[i].sts;
+		}
+	}
+	return sts;
+}
+
+/**
+ * @brief        関数実行状態設定
+ * @param[inout] fid         関数ID情報
+ * @param[in]    fidNum      関数ID数
+ * @param[in]    sts         関数実行状態(0:Idle状態/1:C完了待ち/2:E完了待ち/3:E完了)
+ * @param[in]    funcId      関数ID
+ *
+ * @retval       なし
+ */
+void ClientTcpIo::setFuncIdSts(S_TcpFuncId* fid, int fidNum, E_FuncSts sts, int funcId)
+{
+	for (int i = 0; i < fidNum; i++) {
+		if (funcId == fid[i].funcId) {
+			fid[i].sts = sts;
+			log_printf(LV_DEBUG, "funcStatus(fid:%d) = %d\n", i + 1, fid[i].sts);
+		}
+	}
+	return;
+}
+
+/**
+ * @brief        関数ID取得
+ * @param[in]    fid         関数ID情報
+ * @param[in]    fidNum      関数ID数
+ *
+ * @retval       関数ID
+ */
+int ClientTcpIo::getFuncId(S_TcpFuncId* fid, int fidNum)
+{
+	int funcId = 0;
+
+	// 実行中の関数は同時には1つしかないことを前提として
+	// 現在実行中の関数IDを取得する
+	for (int i = 0; i < fidNum; i++) {
+		if ((fid[i].sts != E_FuncStsIdle) &&
+				(fid[i].sts != E_FuncStsFinE)) {
+			funcId = fid[i].funcId;
+		}
+	}
+	return funcId;
+}
+
+
+----------------------------------------------------------------------------------------------------
